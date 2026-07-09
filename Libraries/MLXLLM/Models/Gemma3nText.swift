@@ -270,41 +270,38 @@ class Gemma3nAttention: Module {
                 cache?.offset ?? 0
             }
 
-        var keys: MLXArray
-        var values: MLXArray
+        var projectedKeysValues: (MLXArray, MLXArray)?
+        var sharedKeysValues: (MLXArray, MLXArray)?
+        var useQuantizedSharedState = false
 
-        if isKvSharedLayer && cache != nil {
-            let state = cache!.state
-            if state.count >= 2 {
-                keys = state[0]
-                values = state[1]
+        if isKvSharedLayer, let cache {
+            if let quantizedCache = cache as? QuantizedKVCacheProtocol,
+                quantizedCache.getQuantizedState() != nil
+            {
+                useQuantizedSharedState = true
+            } else if cache.state.count >= 2 {
+                sharedKeysValues = (cache.state[0], cache.state[1])
             } else {
-                keys = kProj(x).reshaped(B, L, -1, headDim)
+                var keys = kProj(x).reshaped(B, L, -1, headDim)
                 keys = kNorm(keys)
                 keys = keys.transposed(0, 2, 1, 3)
                 keys = rope(keys, offset: offset)
 
-                values = vProj(x).reshaped(B, L, -1, headDim)
+                var values = vProj(x).reshaped(B, L, -1, headDim)
                 values = vNorm(values)
                 values = values.transposed(0, 2, 1, 3)
-
-                if let cache = cache {
-                    (keys, values) = cache.update(keys: keys, values: values)
-                }
+                projectedKeysValues = (keys, values)
             }
         } else {
-            keys = kProj(x).reshaped(B, L, -1, headDim)
+            var keys = kProj(x).reshaped(B, L, -1, headDim)
             keys = kNorm(keys)
             keys = keys.transposed(0, 2, 1, 3)
             keys = rope(keys, offset: offset)
 
-            values = vProj(x).reshaped(B, L, -1, headDim)
+            var values = vProj(x).reshaped(B, L, -1, headDim)
             values = vNorm(values)
             values = values.transposed(0, 2, 1, 3)
-
-            if let cache = cache {
-                (keys, values) = cache.update(keys: keys, values: values)
-            }
+            projectedKeysValues = (keys, values)
         }
 
         queries = queries.transposed(0, 2, 1, 3)
@@ -312,7 +309,19 @@ class Gemma3nAttention: Module {
 
         var adjustedMask = mask
         if case .array(let maskArray) = mask {
-            let keysSeqLen = keys.shape[keys.shape.count - 2]
+            let keysSeqLen: Int
+            if useQuantizedSharedState,
+                let quantizedCache = cache as? QuantizedKVCacheProtocol,
+                let (quantizedKeys, _) = quantizedCache.getQuantizedState()
+            {
+                keysSeqLen = quantizedKeys.0.shape[quantizedKeys.0.shape.count - 2]
+            } else if let sharedKeysValues {
+                keysSeqLen = sharedKeysValues.0.shape[sharedKeysValues.0.shape.count - 2]
+            } else if let projectedKeysValues {
+                keysSeqLen = projectedKeysValues.0.shape[projectedKeysValues.0.shape.count - 2]
+            } else {
+                keysSeqLen = maskArray.shape.last!
+            }
             if maskArray.shape.last! != keysSeqLen {
                 let slicedMask = maskArray[.ellipsis, 0 ..< keysSeqLen].asType(queries.dtype)
                 adjustedMask = .array(slicedMask)
@@ -321,17 +330,48 @@ class Gemma3nAttention: Module {
             }
         }
 
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries,
-            keys: keys,
-            values: values,
-            scale: scale,
-            mask: adjustedMask ?? .none
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        let finalMask = adjustedMask ?? .none
+        let output: MLXArray
+        if useQuantizedSharedState,
+            let quantizedCache = cache as? QuantizedKVCacheProtocol,
+            let (quantizedKeys, quantizedValues) = quantizedCache.getQuantizedState()
+        {
+            output = quantizedScaledDotProductAttention(
+                queries: queries,
+                quantizedKeys: quantizedKeys,
+                quantizedValues: quantizedValues,
+                scale: scale,
+                mask: finalMask,
+                groupSize: quantizedCache.groupSize,
+                bits: quantizedCache.bits,
+                mode: quantizedCache.mode
+            )
+        } else if let sharedKeysValues {
+            output = MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: sharedKeysValues.0,
+                values: sharedKeysValues.1,
+                scale: scale,
+                mask: finalMask
+            )
+        } else if let projectedKeysValues {
+            output = attentionWithCacheUpdate(
+                queries: queries,
+                keys: projectedKeysValues.0,
+                values: projectedKeysValues.1,
+                cache: cache,
+                scale: scale,
+                mask: finalMask
+            )
+        } else {
+            fatalError("Gemma3nAttention: missing keys/values for attention")
+        }
 
-        return oProj(output)
+        return oProj(
+            output
+                .transposed(0, 2, 1, 3)
+                .reshaped(B, L, -1)
+        )
     }
 }
 
