@@ -239,6 +239,17 @@ public struct TopPSampler: LogitSampler {
             logits = logits.asType(.float32)
         }
 
+        // Route around argSort/argPartition where they are known-broken. Needs
+        // top-k for the selection to stay exact, and one row at a time because
+        // the fallback reads the distribution back to the CPU.
+        if let topK, !SortKernelHealth.isTrustworthy, logits.ndim == 2,
+            logits.dim(0) == 1
+        {
+            return withRandomState(randomState) {
+                sampleWithoutSort(logits, topK: topK)
+            }
+        }
+
         return withRandomState(randomState) {
             var logprobs = logSoftmax(logits)
 
@@ -255,6 +266,39 @@ public struct TopPSampler: LogitSampler {
 
             return categorical(logprobs * (1 / temp))
         }
+    }
+
+    /// The same distribution, selected without the broken sort kernels.
+    ///
+    /// Only the *selection* moves to the CPU. The draw stays on the GPU through
+    /// `categorical`, which is correct on the affected hardware, so the seeded
+    /// random state and sampling semantics are unchanged — this is the same
+    /// distribution, reached a different way, not a different sampler.
+    private func sampleWithoutSort(_ logits: MLXArray, topK: Int) -> MLXArray {
+        let logprobs = logSoftmax(logits)
+        eval(logprobs)
+        let values = logprobs.asArray(Float.self)
+
+        let candidates = UnsortedSelection.topIndices(values, k: min(topK, values.count))
+        let kept = UnsortedSelection.filter(
+            candidates,
+            logprobs: values,
+            topP: topP?.item(Float.self),
+            minP: minP?.item(Float.self)
+        )
+        guard let first = kept.first else {
+            // Cannot happen: topIndices returns at least one element for a
+            // non-empty distribution, and filter never empties its input.
+            return categorical(logprobs * (1 / temp))
+        }
+        guard kept.count > 1 else {
+            return MLXArray([UInt32(first)])
+        }
+
+        let survivors = MLXArray(kept.map { values[$0] }, [1, kept.count])
+        let choice = categorical(survivors * (1 / temp))
+        eval(choice)
+        return MLXArray([UInt32(kept[Int(choice.asArray(UInt32.self)[0])])])
     }
 
     /// Keep tokens whose cumulative probability exceeds `1 - topP` (nucleus sampling).
