@@ -43,20 +43,27 @@ func testPlanDivergenceNeedsTrim() {
     let cached = [1, 2, 3, 4, 5]
     let new = [1, 2, 3, 9, 9, 9]
     #expect(promptCacheReusePlan(cached: cached, new: new, canTrim: true) == .reuse(prefix: 3))
-    // Recurrent state cannot be rewound, so a divergence is a cold start.
-    #expect(promptCacheReusePlan(cached: cached, new: new, canTrim: false) == .fresh)
+    // Recurrent state cannot be rewound, so a divergence is a cold start —
+    // and the plan still reports how far the prompts did agree, which is the
+    // number that says this was a refusal and not a divergence at token 0.
+    #expect(
+        promptCacheReusePlan(cached: cached, new: new, canTrim: false)
+            == .fresh(reason: .notTrimmable, commonPrefix: 3))
 }
 
 @Test
 func testPlanRefusesWhenNothingShared() {
-    #expect(promptCacheReusePlan(cached: [1, 2, 3], new: [9, 9, 9], canTrim: true) == .fresh)
+    #expect(
+        promptCacheReusePlan(cached: [1, 2, 3], new: [9, 9, 9], canTrim: true)
+            == .fresh(reason: .belowMinimum, commonPrefix: 0))
 }
 
 @Test
 func testPlanRefusesDegenerateInputs() {
-    #expect(promptCacheReusePlan(cached: [], new: [1, 2, 3], canTrim: true) == .fresh)
-    #expect(promptCacheReusePlan(cached: [1, 2, 3], new: [1], canTrim: true) == .fresh)
-    #expect(promptCacheReusePlan(cached: [1, 2, 3], new: [], canTrim: true) == .fresh)
+    let nothing = PromptCacheReuse.fresh(reason: .nothingToReuse, commonPrefix: 0)
+    #expect(promptCacheReusePlan(cached: [], new: [1, 2, 3], canTrim: true) == nothing)
+    #expect(promptCacheReusePlan(cached: [1, 2, 3], new: [1], canTrim: true) == nothing)
+    #expect(promptCacheReusePlan(cached: [1, 2, 3], new: [], canTrim: true) == nothing)
 }
 
 @Test
@@ -67,7 +74,8 @@ func testPlanHonoursMinimumReuse() {
         promptCacheReusePlan(cached: cached, new: new, canTrim: true, minimumReuse: 2)
             == .reuse(prefix: 2))
     #expect(
-        promptCacheReusePlan(cached: cached, new: new, canTrim: true, minimumReuse: 3) == .fresh)
+        promptCacheReusePlan(cached: cached, new: new, canTrim: true, minimumReuse: 3)
+            == .fresh(reason: .belowMinimum, commonPrefix: 2))
 }
 
 // MARK: - trimPromptCache trims every layer
@@ -158,9 +166,11 @@ func testAdoptExtensionKeepsTheWholeCache() throws {
     let caches = simpleCaches(2, tokens: 4)
     let cache = PromptCache(tokens: [1, 2, 3, 4], caches: caches, maxKVSize: nil)
 
-    let prefix = try #require(cache.adopt([1, 2, 3, 4, 5, 6], maxKVSize: nil))
+    let adoption = cache.adopt([1, 2, 3, 4, 5, 6], maxKVSize: nil)
 
-    #expect(prefix == 4)
+    #expect(adoption.prefix == 4)
+    #expect(adoption.refusal == nil)
+    #expect(adoption.cachedTokens == 4)
     #expect(cache.tokens == [1, 2, 3, 4])
     #expect(caches.allSatisfy { $0.offset == 4 })
 }
@@ -170,9 +180,10 @@ func testAdoptDivergenceRewindsToTheCommonPrefix() throws {
     let caches = simpleCaches(2, tokens: 5)
     let cache = PromptCache(tokens: [1, 2, 3, 4, 5], caches: caches, maxKVSize: nil)
 
-    let prefix = try #require(cache.adopt([1, 2, 3, 9, 9, 9], maxKVSize: nil))
+    let adoption = cache.adopt([1, 2, 3, 9, 9, 9], maxKVSize: nil)
 
-    #expect(prefix == 3)
+    #expect(adoption.prefix == 3)
+    #expect(adoption.refusal == nil)
     #expect(cache.tokens == [1, 2, 3])
     #expect(caches.allSatisfy { $0.offset == 3 })
 }
@@ -183,7 +194,7 @@ func testAdoptRefusesOnDifferentMaxKVSize() {
     let cache = PromptCache(tokens: [1, 2, 3, 4], caches: caches, maxKVSize: 4096)
     // Cache geometry is fixed by maxKVSize, so a hop asking for a different
     // window cannot share these.
-    #expect(cache.adopt([1, 2, 3, 4, 5], maxKVSize: 8192) == nil)
+    #expect(cache.adopt([1, 2, 3, 4, 5], maxKVSize: 8192).refusal == .windowMismatch)
 }
 
 @Test
@@ -197,14 +208,14 @@ func testAdoptRefusesWhenTheCacheHasRotated() {
         tokens: Array(1 ... 10), caches: [rotating], maxKVSize: 8)
     // A rotated cache has silently dropped its early tokens, so the token
     // array no longer describes it.
-    #expect(cache.adopt(Array(1 ... 12), maxKVSize: 8) == nil)
+    #expect(cache.adopt(Array(1 ... 12), maxKVSize: 8).refusal == .rotated)
 }
 
 @Test
 func testAdoptRefusesWhenOffsetDisagreesWithTokens() {
     let caches = simpleCaches(1, tokens: 7)
     let cache = PromptCache(tokens: [1, 2, 3, 4], caches: caches, maxKVSize: nil)
-    #expect(cache.adopt([1, 2, 3, 4, 5], maxKVSize: nil) == nil)
+    #expect(cache.adopt([1, 2, 3, 4, 5], maxKVSize: nil).refusal == .brokenInvariant)
 }
 
 // MARK: - equivalence: a reused prefix must generate what a cold cache does
@@ -260,7 +271,7 @@ func testReusedPrefixGeneratesTheSameTokensAsAColdCache() throws {
             caches: warmup.currentCache,
             maxKVSize: parameters.maxKVSize))
 
-    let reused = try #require(retained.adopt(prompt, maxKVSize: parameters.maxKVSize))
+    let reused = retained.adopt(prompt, maxKVSize: parameters.maxKVSize).prefix
     #expect(reused == prefixLength)
 
     let warm = try generate(
@@ -295,7 +306,7 @@ func testRewoundCacheGeneratesTheSameTokensAsAColdCache() throws {
             promptTokens: first, caches: warmup.currentCache,
             maxKVSize: parameters.maxKVSize))
 
-    let reused = try #require(retained.adopt(second, maxKVSize: parameters.maxKVSize))
+    let reused = retained.adopt(second, maxKVSize: parameters.maxKVSize).prefix
     #expect(reused == 16)
 
     let warm = try generate(
@@ -332,7 +343,7 @@ func testSnapshottedPrefixGeneratesTheSameTokensAsAColdCache() throws {
     _ = warmup.next()
     _ = warmup.next()
 
-    let reused = try #require(snapshot.adopt(prompt, maxKVSize: parameters.maxKVSize))
+    let reused = snapshot.adopt(prompt, maxKVSize: parameters.maxKVSize).prefix
     let warm = try generate(
         prompt, model: model, cache: snapshot.caches, cachedPrefix: reused,
         parameters: parameters, count: 6)
@@ -385,7 +396,30 @@ func testHybridCacheIsRetainedBySnapshot() throws {
     let snapshot = try #require(
         PromptCache.snapshotting(
             promptTokens: prompt, caches: caches, maxKVSize: nil))
-    let reused = try #require(snapshot.adopt([1, 2, 3, 4, 5, 6, 7, 8], maxKVSize: nil))
+    let extension_ = snapshot.adopt([1, 2, 3, 4, 5, 6, 7, 8], maxKVSize: nil)
 
-    #expect(reused == 6)
+    #expect(extension_.prefix == 6)
+    #expect(extension_.refusal == nil)
+}
+
+@Test
+func testHybridRefusesAnythingButAPureExtension() throws {
+    // The structural ceiling on every recurrent hybrid, and the reason a
+    // Nemotron trace shows within-turn reuse and a flat zero across turns: a
+    // tool loop appends, so it extends; a new turn rewrites the middle of the
+    // prompt, and there is no rewinding a Mamba state to meet it.
+    let caches = nemotronShapedCaches(tokens: 6)
+    let snapshot = try #require(
+        PromptCache.snapshotting(
+            promptTokens: [1, 2, 3, 4, 5, 6], caches: caches, maxKVSize: nil))
+
+    let adoption = snapshot.adopt([1, 2, 3, 9, 9, 9, 9], maxKVSize: nil)
+
+    #expect(adoption.prefix == 0)
+    #expect(adoption.refusal == .notTrimmable)
+    // The prompts agreed for three tokens; the cache simply could not be
+    // rewound to them. Without this a caller sees only a zero and cannot tell
+    // the two apart.
+    #expect(adoption.commonPrefix == 3)
+    #expect(adoption.cachedTokens == 6)
 }

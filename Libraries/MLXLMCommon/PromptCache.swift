@@ -2,10 +2,50 @@
 
 import Foundation
 
+/// Why a cache could not serve a prompt.
+///
+/// Diagnostic only: nothing branches on it, and every case means the same thing
+/// to the caller — build a fresh cache. It exists because a refusal otherwise
+/// reaches a log or a trace as a bare zero, and the zeroes mean very different
+/// things. ``notTrimmable`` in particular is a *structural* refusal that no
+/// amount of prompt tuning removes.
+public enum PromptCacheRefusal: String, Equatable, Sendable {
+    /// The cache is empty, or the new prompt is too short to leave a token to
+    /// feed the model once anything is reused.
+    case nothingToReuse
+
+    /// The prompts share fewer leading tokens than `minimumReuse` asked for.
+    case belowMinimum
+
+    /// A partial match, and these caches cannot be rewound to it. Every
+    /// recurrent hybrid lands here on any prompt that is not a pure extension,
+    /// which is every prompt that is not the next hop of the same turn.
+    case notTrimmable
+
+    /// The generation asked for a different `maxKVSize`, and cache geometry
+    /// depends on it.
+    case windowMismatch
+
+    /// `offset == tokens.count` no longer holds, so the cache does not describe
+    /// itself truthfully.
+    case brokenInvariant
+
+    /// A cache at its ceiling has silently dropped its early tokens, so the
+    /// token array no longer describes it.
+    case rotated
+
+    /// The rewind trimmed fewer tokens than it was asked for.
+    case partialRewind
+}
+
 /// What a ``PromptCache`` can do for a new prompt.
 public enum PromptCacheReuse: Equatable, Sendable {
     /// The cache is unusable for this prompt; build a fresh one.
-    case fresh
+    ///
+    /// `commonPrefix` is how far the two prompts did agree. It is what
+    /// separates "these prompts have nothing in common" from "they agreed for
+    /// 690 tokens and the cache could not be rewound to it".
+    case fresh(reason: PromptCacheRefusal, commonPrefix: Int)
 
     /// The first `prefix` tokens of the new prompt are already in the cache.
     /// Only `newTokens[prefix...]` needs to be prefilled.
@@ -34,21 +74,28 @@ public func promptCacheReusePlan(
 ) -> PromptCacheReuse {
     // `new.count > 1` because of the back-off below: a one-token prompt has
     // nothing left to feed once anything is reused.
-    guard !cached.isEmpty, new.count > 1 else { return .fresh }
+    guard !cached.isEmpty, new.count > 1 else {
+        return .fresh(reason: .nothingToReuse, commonPrefix: 0)
+    }
 
     var n = 0
     let limit = min(cached.count, new.count)
     while n < limit, cached[n] == new[n] { n += 1 }
+    let commonPrefix = n
 
     // Always leave at least one token for the model to process. A fully cached
     // prompt would otherwise hand `TokenIterator` an empty input and it has
     // nothing to produce logits from.
     n = min(n, new.count - 1)
 
-    guard n >= max(1, minimumReuse) else { return .fresh }
+    guard n >= max(1, minimumReuse) else {
+        return .fresh(reason: .belowMinimum, commonPrefix: commonPrefix)
+    }
 
     // Serving less than the cache holds means rewinding it first.
-    if n < cached.count, !canTrim { return .fresh }
+    if n < cached.count, !canTrim {
+        return .fresh(reason: .notTrimmable, commonPrefix: commonPrefix)
+    }
 
     return .reuse(prefix: n)
 }
@@ -164,26 +211,42 @@ public final class PromptCache {
 
     /// Prepare this cache to serve `newTokens`, rewinding it if needed.
     ///
-    /// Returns the number of leading tokens of `newTokens` the caller may skip
-    /// prefilling, or nil when the cache cannot serve this prompt at all — in
-    /// which case the caller should drop it and build a fresh one.
-    ///
     /// On success `self` describes the cache truthfully again: `tokens` holds
-    /// the reused prefix and every cache's offset matches it.
-    public func adopt(_ newTokens: [Int], maxKVSize: Int?, minimumReuse: Int = 1) -> Int? {
-        guard self.maxKVSize == maxKVSize else { return nil }
-        guard !caches.isEmpty, Self.tokenCount(of: caches) == tokens.count else {
-            return nil
+    /// the reused prefix and every cache's offset matches it. On a refusal the
+    /// caller should drop this cache and build a fresh one, and
+    /// ``PromptCacheAdoption/refusal`` says why — a zero prefix on its own
+    /// cannot distinguish "these prompts share nothing" from "they shared 690
+    /// tokens and this cache cannot be rewound".
+    public func adopt(
+        _ newTokens: [Int], maxKVSize: Int?, minimumReuse: Int = 1
+    ) -> PromptCacheAdoption {
+        let held = tokens.count
+        func refuse(
+            _ reason: PromptCacheRefusal, commonPrefix: Int = 0
+        ) -> PromptCacheAdoption {
+            PromptCacheAdoption(
+                prefix: 0, cachedTokens: held,
+                commonPrefix: commonPrefix, refusal: reason)
         }
-        guard !Self.hasRotated(caches) else { return nil }
 
-        let plan = promptCacheReusePlan(
+        guard self.maxKVSize == maxKVSize else { return refuse(.windowMismatch) }
+        guard !caches.isEmpty, Self.tokenCount(of: caches) == tokens.count else {
+            return refuse(.brokenInvariant)
+        }
+        guard !Self.hasRotated(caches) else { return refuse(.rotated) }
+
+        let prefix: Int
+        switch promptCacheReusePlan(
             cached: tokens,
             new: newTokens,
             canTrim: canTrimPromptCache(caches),
             minimumReuse: minimumReuse
-        )
-        guard case .reuse(let prefix) = plan else { return nil }
+        ) {
+        case .reuse(let p):
+            prefix = p
+        case .fresh(let reason, let commonPrefix):
+            return refuse(reason, commonPrefix: commonPrefix)
+        }
 
         let rewind = tokens.count - prefix
         if rewind > 0 {
@@ -193,10 +256,48 @@ public final class PromptCache {
                 // truthfully so nothing downstream trusts a stale count, and
                 // refuse the reuse.
                 tokens = Array(tokens[..<(tokens.count - trimmed)])
-                return nil
+                return refuse(.partialRewind, commonPrefix: prefix)
             }
         }
         tokens = Array(newTokens[..<prefix])
-        return prefix
+        return PromptCacheAdoption(
+            prefix: prefix, cachedTokens: held,
+            commonPrefix: prefix, refusal: nil)
     }
+}
+
+/// What ``PromptCache/adopt(_:maxKVSize:minimumReuse:)`` did, and why.
+///
+/// Every field is here so a caller can report a refusal without inferring it.
+/// `prefix == 0` alone is three different situations — no cache was offered,
+/// the prompts diverged immediately, or a partial match could not be rewound to
+/// — and telling them apart is the difference between a prompt worth changing
+/// and a model that will never reuse across turns.
+public struct PromptCacheAdoption: Equatable, Sendable {
+    /// Leading tokens of the new prompt the caller may skip prefilling. Zero
+    /// when the cache was refused.
+    public let prefix: Int
+
+    /// How many tokens the cache held when it was offered this prompt.
+    public let cachedTokens: Int
+
+    /// How far the two token sequences agreed. On success this equals
+    /// ``prefix``, except in the rare case where the whole new prompt was
+    /// already cached and one token had to be left over to feed the model.
+    public let commonPrefix: Int
+
+    /// Why the cache was refused; nil when it was not.
+    public let refusal: PromptCacheRefusal?
+
+    public init(
+        prefix: Int, cachedTokens: Int, commonPrefix: Int,
+        refusal: PromptCacheRefusal?
+    ) {
+        self.prefix = prefix
+        self.cachedTokens = cachedTokens
+        self.commonPrefix = commonPrefix
+        self.refusal = refusal
+    }
+
+    public var didReuse: Bool { prefix > 0 }
 }
