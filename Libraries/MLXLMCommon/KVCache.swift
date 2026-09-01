@@ -1516,10 +1516,20 @@ public func canTrimPromptCache(_ cache: [KVCache]) -> Bool {
 ///
 /// This function will trim the cache if possible (in-place) and return the
 /// number of tokens that were trimmed.
+///
+/// Every entry is trimmed, not just the first: the array holds one cache per
+/// layer and they must stay at a common offset. Trimming only `cache.first`
+/// rewinds layer 0 while every other layer keeps its tokens, which corrupts
+/// the model silently rather than failing.
 @discardableResult
 public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
     guard canTrimPromptCache(cache), !cache.isEmpty else { return 0 }
-    return cache.first?.trim(numTokens) ?? 0
+    var trimmed = 0
+    for (index, c) in cache.enumerated() {
+        let n = c.trim(numTokens)
+        if index == 0 { trimmed = n }
+    }
+    return trimmed
 }
 
 // MARK: - Type Aliases

@@ -645,6 +645,49 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         }
     }
 
+    /// Initialize a `TokenIterator` against a cache that already holds a
+    /// prefix of this prompt.
+    ///
+    /// `cache` must already contain the first `cachedPrefix` tokens of
+    /// `input`, and nothing after them — see ``PromptCache``, which maintains
+    /// exactly that invariant. Only `input[cachedPrefix...]` is prefilled;
+    /// positions come from the cache's own offset, so the model sees the same
+    /// sequence it would have seen from a cold cache.
+    ///
+    /// The logit processor is still seeded with the **whole** prompt.
+    /// Repetition penalties are defined over the prompt, not over whichever
+    /// part of it happened to miss the cache, so seeding them from the suffix
+    /// alone would make a cached run sample differently from a cold one.
+    ///
+    /// - Parameters:
+    ///   - input: language model input
+    ///   - model: the ``LanguageModel``
+    ///   - cache: a cache holding the first `cachedPrefix` tokens of `input`
+    ///   - cachedPrefix: how many leading tokens the cache already holds
+    ///   - parameters: the generation parameters
+    public init(
+        input: LMInput, model: any LanguageModel, cache: [KVCache], cachedPrefix: Int,
+        parameters: GenerateParameters
+    ) throws {
+        self.model = model
+        self.y = input.text
+        self.cache = cache
+
+        self.processor = parameters.processor()
+        self.sampler = parameters.sampler()
+        self.maxTokens = parameters.maxTokens
+
+        self.kvBits = parameters.kvBits
+        self.kvGroupSize = parameters.kvGroupSize
+        self.quantizedKVStart = parameters.quantizedKVStart
+
+        self.promptPrefillTime = try measure {
+            try prepare(
+                input: input, cachedPrefix: cachedPrefix,
+                windowSize: parameters.prefillStepSize)
+        }
+    }
+
     /// Initialize a `TokenIterator` with the given input and logit handling.
     ///
     /// - Parameters:
@@ -678,10 +721,34 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         }
     }
 
-    mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+    /// The ``KVCache`` this iterator is generating into.
+    ///
+    /// Exposed for prefix caching: immediately after `init` the cache holds
+    /// exactly the prompt, which is the only moment a cache that cannot be
+    /// rewound can be snapshotted. After iteration it also holds the generated
+    /// tokens. See ``PromptCache``.
+    public var currentCache: [KVCache] { cache }
+
+    mutating func prepare(
+        input: LMInput, cachedPrefix: Int = 0, windowSize: Int? = nil
+    ) throws {
+        // Seeded from the full prompt even when only the tail of it is about
+        // to be prefilled -- see
+        // ``init(input:model:cache:cachedPrefix:parameters:)``.
         processor?.prompt(input.text.tokens)
 
-        switch try model.prepare(input, cache: cache, windowSize: windowSize) {
+        let pending: LMInput
+        if cachedPrefix > 0 {
+            pending = LMInput(
+                text: input.text[cachedPrefix...],
+                image: input.image,
+                video: input.video
+            )
+        } else {
+            pending = input
+        }
+
+        switch try model.prepare(pending, cache: cache, windowSize: windowSize) {
         case .tokens(let tokens):
             y = tokens
 
