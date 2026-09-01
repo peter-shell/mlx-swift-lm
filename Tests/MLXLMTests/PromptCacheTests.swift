@@ -339,3 +339,53 @@ func testSnapshottedPrefixGeneratesTheSameTokensAsAColdCache() throws {
 
     #expect(warm == cold)
 }
+
+// MARK: - hybrid cache arrays
+
+/// `NemotronH.newCache` returns a flat mix of `MambaCache` and `KVCacheSimple`
+/// with a **Mamba layer first**, and the model never touches `MambaCache.offset`
+/// — it reports 0 for the whole run. Anything reading `caches.first.offset` to
+/// learn how many tokens a cache holds therefore sees 0 and silently refuses
+/// every reuse, which is what a 0 % cache-hit rate on Nemotron 3 Nano 4B across
+/// two devices turned out to be.
+private func nemotronShapedCaches(tokens: Int) -> [KVCache] {
+    let caches: [KVCache] = [
+        MambaCache(), KVCacheSimple(), MambaCache(), KVCacheSimple(),
+    ]
+    let keys = MLXArray.ones([1, 8, tokens, 64], dtype: .bfloat16)
+    let values = MLXArray.ones([1, 8, tokens, 64], dtype: .bfloat16)
+    for cache in caches {
+        switch cache {
+        case let arrays as ArraysCache:
+            // recurrent state: fixed size, no offset tracking
+            arrays[0] = keys
+            arrays[1] = values
+        default:
+            _ = cache.update(keys: keys, values: values)
+        }
+    }
+    return caches
+}
+
+@Test
+func testTokenCountIgnoresCachesThatDoNotTrackAnOffset() {
+    let caches = nemotronShapedCaches(tokens: 12)
+
+    #expect(caches.first!.offset == 0, "the Mamba cache tracks no offset")
+    #expect(PromptCache.tokenCount(of: caches) == 12)
+}
+
+@Test
+func testHybridCacheIsRetainedBySnapshot() throws {
+    let caches = nemotronShapedCaches(tokens: 6)
+    let prompt = [1, 2, 3, 4, 5, 6]
+
+    #expect(PromptCache.requiresSnapshot(caches), "recurrent state cannot rewind")
+
+    let snapshot = try #require(
+        PromptCache.snapshotting(
+            promptTokens: prompt, caches: caches, maxKVSize: nil))
+    let reused = try #require(snapshot.adopt([1, 2, 3, 4, 5, 6, 7, 8], maxKVSize: nil))
+
+    #expect(reused == 6)
+}

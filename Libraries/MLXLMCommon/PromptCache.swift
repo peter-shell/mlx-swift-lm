@@ -92,6 +92,20 @@ public final class PromptCache {
 
     public var tokenCount: Int { tokens.count }
 
+    /// How many tokens a cache array holds.
+    ///
+    /// The **maximum** offset, not `caches.first.offset`. A hybrid model's
+    /// array mixes attention caches, which count tokens, with recurrent ones,
+    /// which carry a fixed-size state and never track an offset at all —
+    /// `NemotronH.newCache` returns `[MambaCache, ...]` and the model never
+    /// touches `offset`, so the first entry reports 0 for the whole run.
+    /// Reading it made every hybrid refuse reuse silently: measured as a flat
+    /// 0 % cache hit on Nemotron 3 Nano 4B across two devices, on the models
+    /// where prefill is the *largest* share of a turn.
+    public static func tokenCount(of caches: [KVCache]) -> Int {
+        caches.reduce(0) { max($0, $1.offset) }
+    }
+
     /// Whether these caches must be copied to be retained, rather than rewound.
     public static func requiresSnapshot(_ caches: [KVCache]) -> Bool {
         !canTrimPromptCache(caches)
@@ -117,15 +131,15 @@ public final class PromptCache {
     public static func retaining(
         promptTokens: [Int], caches: [KVCache], maxKVSize: Int?
     ) -> PromptCache? {
-        guard let first = caches.first, !promptTokens.isEmpty else { return nil }
+        guard !caches.isEmpty, !promptTokens.isEmpty else { return nil }
         guard !hasRotated(caches), canTrimPromptCache(caches) else { return nil }
 
-        let excess = first.offset - promptTokens.count
+        let excess = tokenCount(of: caches) - promptTokens.count
         guard excess >= 0 else { return nil }
         if excess > 0 {
             trimPromptCache(caches, numTokens: excess)
         }
-        guard first.offset == promptTokens.count else { return nil }
+        guard tokenCount(of: caches) == promptTokens.count else { return nil }
 
         return PromptCache(tokens: promptTokens, caches: caches, maxKVSize: maxKVSize)
     }
@@ -137,9 +151,9 @@ public final class PromptCache {
     public static func snapshotting(
         promptTokens: [Int], caches: [KVCache], maxKVSize: Int?
     ) -> PromptCache? {
-        guard let first = caches.first, !promptTokens.isEmpty else { return nil }
+        guard !caches.isEmpty, !promptTokens.isEmpty else { return nil }
         guard !hasRotated(caches) else { return nil }
-        guard first.offset == promptTokens.count else { return nil }
+        guard tokenCount(of: caches) == promptTokens.count else { return nil }
 
         return PromptCache(
             tokens: promptTokens,
@@ -158,7 +172,9 @@ public final class PromptCache {
     /// the reused prefix and every cache's offset matches it.
     public func adopt(_ newTokens: [Int], maxKVSize: Int?, minimumReuse: Int = 1) -> Int? {
         guard self.maxKVSize == maxKVSize else { return nil }
-        guard let first = caches.first, first.offset == tokens.count else { return nil }
+        guard !caches.isEmpty, Self.tokenCount(of: caches) == tokens.count else {
+            return nil
+        }
         guard !Self.hasRotated(caches) else { return nil }
 
         let plan = promptCacheReusePlan(

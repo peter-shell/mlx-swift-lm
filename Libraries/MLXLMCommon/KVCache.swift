@@ -1525,9 +1525,8 @@ public func canTrimPromptCache(_ cache: [KVCache]) -> Bool {
 public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
     guard canTrimPromptCache(cache), !cache.isEmpty else { return 0 }
     var trimmed = 0
-    for (index, c) in cache.enumerated() {
-        let n = c.trim(numTokens)
-        if index == 0 { trimmed = n }
+    for c in cache {
+        trimmed = max(trimmed, c.trim(numTokens))
     }
     return trimmed
 }
