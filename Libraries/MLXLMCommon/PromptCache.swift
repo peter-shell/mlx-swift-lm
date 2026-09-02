@@ -36,6 +36,11 @@ public enum PromptCacheRefusal: String, Equatable, Sendable {
 
     /// The rewind trimmed fewer tokens than it was asked for.
     case partialRewind
+
+    /// The cache array mixes window geometries, so no single entry describes
+    /// it and the model's mask would be built for the wrong one. See
+    /// ``PromptCache/hasMixedWindowGeometry(_:)``.
+    case mixedWindowGeometry
 }
 
 /// What a ``PromptCache`` can do for a new prompt.
@@ -170,6 +175,36 @@ public final class PromptCache {
         }
     }
 
+    /// Whether one entry of this array can speak for all of them.
+    ///
+    /// The library derives a prompt's attention mask from a *single* cache:
+    /// `createAttentionMask(h:cache:)` takes one, and a model with interleaved
+    /// window sizes hand-picks an index per geometry — Gemma 3n reads
+    /// `cacheArray[firstFullIdx]` and `cacheArray[firstSlidingIdx]`, Mistral 3
+    /// reads `cache?[faIdx]` and `cache?[swaIdx]`. That is sound while every
+    /// layer enters a forward pass at the same offset, which is true of a cold
+    /// prefill and false the moment a prefix is reused: the mask is built for
+    /// one geometry while the keys come from another, and MLX fails the
+    /// broadcast rather than the answer.
+    ///
+    /// Uniform arrays are unaffected, which is most of them: every layer
+    /// rotating at the same size — what `newCache(parameters:)` returns for any
+    /// model given a `maxKVSize` — or none of them rotating at all, since a
+    /// recurrent hybrid's state reports no ceiling. Only a model that
+    /// interleaves *local* and *global* attention in one array is refused.
+    ///
+    /// Measured: reusing 116 tokens into Gemma 3n E2B produced a (641, 641)
+    /// mask against (1, 8, 641, 757) scores and killed the process.
+    public static func hasMixedWindowGeometry(_ caches: [KVCache]) -> Bool {
+        var geometries = Set<Int>()
+        for cache in caches {
+            // -1 stands in for "no ceiling", which is itself a geometry.
+            geometries.insert(cache.maxSize ?? -1)
+            if geometries.count > 1 { return true }
+        }
+        return false
+    }
+
     /// Rewind `caches` past the generated tail so they hold exactly
     /// `promptTokens`, and retain them.
     ///
@@ -180,6 +215,8 @@ public final class PromptCache {
     ) -> PromptCache? {
         guard !caches.isEmpty, !promptTokens.isEmpty else { return nil }
         guard !hasRotated(caches), canTrimPromptCache(caches) else { return nil }
+        // Never adoptable, so retaining it would only cost memory.
+        guard !hasMixedWindowGeometry(caches) else { return nil }
 
         let excess = tokenCount(of: caches) - promptTokens.count
         guard excess >= 0 else { return nil }
@@ -200,6 +237,7 @@ public final class PromptCache {
     ) -> PromptCache? {
         guard !caches.isEmpty, !promptTokens.isEmpty else { return nil }
         guard !hasRotated(caches) else { return nil }
+        guard !hasMixedWindowGeometry(caches) else { return nil }
         guard tokenCount(of: caches) == promptTokens.count else { return nil }
 
         return PromptCache(
@@ -234,6 +272,9 @@ public final class PromptCache {
             return refuse(.brokenInvariant)
         }
         guard !Self.hasRotated(caches) else { return refuse(.rotated) }
+        guard !Self.hasMixedWindowGeometry(caches) else {
+            return refuse(.mixedWindowGeometry)
+        }
 
         let prefix: Int
         switch promptCacheReusePlan(

@@ -402,6 +402,63 @@ func testHybridCacheIsRetainedBySnapshot() throws {
     #expect(extension_.refusal == nil)
 }
 
+/// Gemma 3n / Mistral 3 shape: local sliding layers interleaved with global
+/// ones, so the array holds two different window geometries at once.
+private func interleavedSlidingCaches(window: Int, tokens: Int) -> [KVCache] {
+    let caches: [KVCache] = [
+        RotatingKVCache(maxSize: window, keep: 0),
+        RotatingKVCache(maxSize: window, keep: 0),
+        KVCacheSimple(),
+    ]
+    feed(caches, tokens: tokens)
+    return caches
+}
+
+@Test
+func testMixedWindowGeometryIsRefused() {
+    // A model that interleaves local and global attention builds one mask per
+    // geometry from a single hand-picked cache index. That holds while every
+    // layer starts a forward pass at the same offset -- which a cold prefill
+    // guarantees and a reused prefix does not. Reusing 116 tokens into Gemma 3n
+    // E2B built a (641, 641) mask against (1, 8, 641, 757) scores and killed
+    // the process, so the array is refused before it can.
+    let mixed = interleavedSlidingCaches(window: 512, tokens: 120)
+    #expect(PromptCache.hasMixedWindowGeometry(mixed))
+
+    let cache = PromptCache(
+        tokens: Array(0 ..< 120), caches: mixed, maxKVSize: nil)
+    let adoption = cache.adopt(Array(0 ..< 200), maxKVSize: nil)
+
+    #expect(adoption.prefix == 0)
+    #expect(adoption.refusal == .mixedWindowGeometry)
+
+    // And it is never retained in the first place, so it costs no memory
+    // either.
+    #expect(
+        PromptCache.retaining(
+            promptTokens: Array(0 ..< 120), caches: mixed, maxKVSize: nil) == nil)
+    #expect(
+        PromptCache.snapshotting(
+            promptTokens: Array(0 ..< 120), caches: mixed, maxKVSize: nil) == nil)
+}
+
+@Test
+func testUniformGeometryIsStillReused() {
+    // The guard must not catch the ordinary cases. Every layer rotating at one
+    // size is what `newCache` returns for any model given a maxKVSize; no layer
+    // rotating at all is a plain attention model, and a recurrent hybrid whose
+    // state reports no ceiling looks the same.
+    let allRotating = (0 ..< 3).map { _ in RotatingKVCache(maxSize: 512, keep: 0) }
+    #expect(!PromptCache.hasMixedWindowGeometry(allRotating))
+    #expect(!PromptCache.hasMixedWindowGeometry(simpleCaches(3, tokens: 4)))
+    #expect(!PromptCache.hasMixedWindowGeometry(nemotronShapedCaches(tokens: 4)))
+
+    // ... and reuse still happens on one of them.
+    let caches = simpleCaches(2, tokens: 4)
+    let cache = PromptCache(tokens: [1, 2, 3, 4], caches: caches, maxKVSize: nil)
+    #expect(cache.adopt([1, 2, 3, 4, 5, 6], maxKVSize: nil).prefix == 4)
+}
+
 @Test
 func testHybridRefusesAnythingButAPureExtension() throws {
     // The structural ceiling on every recurrent hybrid, and the reason a
