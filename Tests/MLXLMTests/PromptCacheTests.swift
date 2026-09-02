@@ -281,6 +281,35 @@ func testReusedPrefixGeneratesTheSameTokensAsAColdCache() throws {
     #expect(warm == cold)
 }
 
+/// A `[1, N]` prompt -- how VLM and multimodal processors hand tokens over --
+/// must lose its prefix from the token axis, not from the batch axis.
+///
+/// Slicing axis 0 of one of those leaves nothing at all, and the model dies on
+/// `reshape` rather than generating. Mistral 3 is such a text tower and it
+/// crashed on the second turn of every conversation. A 1-D prompt slices the
+/// same either way, so nothing else here catches it.
+@Test
+func testPromptSuffixSlicesTheTokenAxisNotTheBatchAxis() {
+    let batched = LMInput.Text(tokens: MLXArray(0 ..< 24).reshaped([1, 24]))
+    let suffix = promptSuffix(batched, cachedPrefix: 16)
+
+    #expect(suffix.tokens.shape == [1, 8])
+    #expect(suffix.tokens.asArray(Int.self) == Array(16 ..< 24))
+
+    // 1-D prompts are unchanged, which is every text-only model.
+    let flat = LMInput.Text(tokens: MLXArray(0 ..< 24))
+    #expect(promptSuffix(flat, cachedPrefix: 16).tokens.shape == [8])
+
+    // A mask, when there is one, follows the tokens.
+    let masked = LMInput.Text(
+        tokens: MLXArray(0 ..< 24).reshaped([1, 24]),
+        mask: MLXArray.ones([1, 24]))
+    #expect(promptSuffix(masked, cachedPrefix: 16).mask?.shape == [1, 8])
+
+    // And nothing is sliced when nothing was cached.
+    #expect(promptSuffix(batched, cachedPrefix: 0).tokens.shape == [1, 24])
+}
+
 /// The same property across a rewind: a cache holding one prompt, trimmed back
 /// to the common prefix, must serve a diverging prompt correctly.
 @Test

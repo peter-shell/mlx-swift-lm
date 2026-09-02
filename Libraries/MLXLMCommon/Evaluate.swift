@@ -737,16 +737,12 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         // ``init(input:model:cache:cachedPrefix:parameters:)``.
         processor?.prompt(input.text.tokens)
 
-        let pending: LMInput
-        if cachedPrefix > 0 {
-            pending = LMInput(
-                text: input.text[cachedPrefix...],
+        let pending = cachedPrefix > 0
+            ? LMInput(
+                text: promptSuffix(input.text, cachedPrefix: cachedPrefix),
                 image: input.image,
-                video: input.video
-            )
-        } else {
-            pending = input
-        }
+                video: input.video)
+            : input
 
         switch try model.prepare(pending, cache: cache, windowSize: windowSize) {
         case .tokens(let tokens):

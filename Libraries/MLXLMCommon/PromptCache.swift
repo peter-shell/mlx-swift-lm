@@ -105,6 +105,27 @@ public func promptCacheReusePlan(
     return .reuse(prefix: n)
 }
 
+/// The part of `text` still needing a prefill once `cachedPrefix` of its tokens
+/// are already in the cache.
+///
+/// The token axis is the **last** one, not the first. VLM and multimodal
+/// processors hand tokens over as `[1, N]`, and slicing axis 0 of one of those
+/// drops the entire prompt: the suffix comes back empty and the model dies on
+/// `reshape` with "cannot infer the shape of an empty array". A 1-D prompt
+/// slices identically either way, which is why it took a multimodal text tower
+/// to find. Same batch-axis confusion `TokenRing.loadPrompt` was fixed for.
+public func promptSuffix(_ text: LMInput.Text, cachedPrefix: Int) -> LMInput.Text {
+    guard cachedPrefix > 0 else { return text }
+    if text.tokens.ndim == 1 {
+        return .init(
+            tokens: text.tokens[cachedPrefix...],
+            mask: text.mask.map { $0[cachedPrefix...] })
+    }
+    return .init(
+        tokens: text.tokens[.ellipsis, cachedPrefix...],
+        mask: text.mask.map { $0[.ellipsis, cachedPrefix...] })
+}
+
 /// A KV cache plus the exact token sequence that produced it.
 ///
 /// The invariant that makes reuse safe is `caches[i].offset == tokens.count`
