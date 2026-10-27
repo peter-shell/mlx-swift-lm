@@ -61,6 +61,7 @@ public enum LLMTypeRegistry {
         "smollm3": create(SmolLM3Configuration.self, SmolLM3Model.init),
         "ernie4_5": create(Ernie45Configuration.self, Ernie45Model.init),
         "lfm2": create(LFM2Configuration.self, LFM2Model.init),
+        "lfm3": create(LFM3Configuration.self, LFM3Model.init),
         "baichuan_m1": create(BaichuanM1Configuration.self, BaichuanM1Model.init),
         "exaone4": create(Exaone4Configuration.self, Exaone4Model.init),
         "gpt_oss": create(GPTOSSConfiguration.self, GPTOSSModel.init),

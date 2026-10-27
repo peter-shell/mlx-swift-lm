@@ -526,6 +526,7 @@ struct ToolTests {
         #expect(ToolCallFormat.infer(from: "lfm2_5") == .lfm2)
         #expect(ToolCallFormat.infer(from: "LFM2_5") == .lfm2)
         #expect(ToolCallFormat.infer(from: "lfm25") == .lfm2)
+        #expect(ToolCallFormat.infer(from: "lfm3") == .xmlFunction)
 
         // GLM4 models (prefix matching)
         #expect(ToolCallFormat.infer(from: "glm4") == .glm4)

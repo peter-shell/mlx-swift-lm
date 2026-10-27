@@ -135,6 +135,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .lfm2
         }
 
+        // LFM3 moved to the XML function format Qwen3.5 uses.
+        if type.hasPrefix("lfm3") {
+            return .xmlFunction
+        }
+
         // GLM4 family (glm4, glm4_moe, glm4_moe_lite, etc.)
         if type.hasPrefix("glm4") {
             return .glm4
