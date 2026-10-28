@@ -379,7 +379,7 @@ public class LFM3ModelInner: Module {
     }
 }
 
-public class LFM3Model: Module, LLMModel, KVCacheDimensionProvider {
+public class LFM3Model: Module, LLMModel, KVCacheDimensionProvider, MasksEachCacheGeometry {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 

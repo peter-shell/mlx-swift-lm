@@ -126,6 +126,18 @@ public func promptSuffix(_ text: LMInput.Text, cachedPrefix: Int) -> LMInput.Tex
         mask: text.mask.map { $0[.ellipsis, cachedPrefix...] })
 }
 
+/// A model whose forward pass builds every attention mask from a real cache of
+/// the geometry that mask serves, and never from a substitute.
+///
+/// ``PromptCache`` refuses a cache array that mixes window geometries, because
+/// the mask machinery reads one entry per geometry and a model that falls back
+/// to `nil` where that entry is missing builds a no-cache mask. A cold prefill
+/// cannot tell the two apart; a reused prefix can, and Gemma 3n died of it.
+/// Conforming says the fallback is not there: each mask comes from a
+/// `cache[i]` of its own kind, whatever offset the pass starts at. Conform only
+/// with a test that a reused prefix generates what a cold cache does.
+public protocol MasksEachCacheGeometry {}
+
 /// A KV cache plus the exact token sequence that produced it.
 ///
 /// The invariant that makes reuse safe is `caches[i].offset == tokens.count`
@@ -189,9 +201,18 @@ public final class PromptCache {
     /// A rotated cache has silently dropped everything but its first few
     /// tokens, so the token array no longer describes it. Reuse is refused
     /// rather than trusted.
-    public static func hasRotated(_ caches: [KVCache]) -> Bool {
+    ///
+    /// Except below `maxKVSize`. A cache whose ceiling is tighter than the one
+    /// the generation asked for is a sliding window the model chose — LFM3's
+    /// 256-token layers — and rotating is what it is for: attention there never
+    /// sees past the window, so nothing it would read has been dropped. Such a
+    /// cache stops being trimmable once it rotates, so it can only be extended,
+    /// which is the same path a cold prefill takes when its second chunk reaches
+    /// a rotated window. Without a `maxKVSize` every rotation is refused.
+    public static func hasRotated(_ caches: [KVCache], maxKVSize: Int? = nil) -> Bool {
         caches.contains { cache in
             guard let maxSize = cache.maxSize else { return false }
+            if let maxKVSize, maxSize < maxKVSize { return false }
             return cache.offset >= maxSize
         }
     }
@@ -216,9 +237,14 @@ public final class PromptCache {
     ///
     /// Measured: reusing 116 tokens into Gemma 3n E2B produced a (641, 641)
     /// mask against (1, 8, 641, 757) scores and killed the process.
+    ///
+    /// Recurrent state is not a geometry. A `MambaCache` takes no mask and
+    /// reports no ceiling, so counting it made every LFM array — conv state
+    /// beside attention rotating at `maxKVSize` — read as mixed and lose the
+    /// snapshot reuse a Nemotron keeps.
     public static func hasMixedWindowGeometry(_ caches: [KVCache]) -> Bool {
         var geometries = Set<Int>()
-        for cache in caches {
+        for cache in caches where !(cache is ArraysCache) {
             // -1 stands in for "no ceiling", which is itself a geometry.
             geometries.insert(cache.maxSize ?? -1)
             if geometries.count > 1 { return true }
@@ -232,12 +258,14 @@ public final class PromptCache {
     /// Returns nil when the caches cannot be rewound, when they hold fewer
     /// tokens than the prompt, or when they have rotated.
     public static func retaining(
-        promptTokens: [Int], caches: [KVCache], maxKVSize: Int?
+        promptTokens: [Int], caches: [KVCache], maxKVSize: Int?,
+        allowsMixedGeometry: Bool = false
     ) -> PromptCache? {
         guard !caches.isEmpty, !promptTokens.isEmpty else { return nil }
-        guard !hasRotated(caches), canTrimPromptCache(caches) else { return nil }
+        guard !hasRotated(caches, maxKVSize: maxKVSize), canTrimPromptCache(caches)
+        else { return nil }
         // Never adoptable, so retaining it would only cost memory.
-        guard !hasMixedWindowGeometry(caches) else { return nil }
+        guard allowsMixedGeometry || !hasMixedWindowGeometry(caches) else { return nil }
 
         let excess = tokenCount(of: caches) - promptTokens.count
         guard excess >= 0 else { return nil }
@@ -254,11 +282,12 @@ public final class PromptCache {
     /// Must be called while the caches hold exactly `promptTokens` — after
     /// prefill, before any token is decoded. Returns nil if they do not.
     public static func snapshotting(
-        promptTokens: [Int], caches: [KVCache], maxKVSize: Int?
+        promptTokens: [Int], caches: [KVCache], maxKVSize: Int?,
+        allowsMixedGeometry: Bool = false
     ) -> PromptCache? {
         guard !caches.isEmpty, !promptTokens.isEmpty else { return nil }
-        guard !hasRotated(caches) else { return nil }
-        guard !hasMixedWindowGeometry(caches) else { return nil }
+        guard !hasRotated(caches, maxKVSize: maxKVSize) else { return nil }
+        guard allowsMixedGeometry || !hasMixedWindowGeometry(caches) else { return nil }
         guard tokenCount(of: caches) == promptTokens.count else { return nil }
 
         return PromptCache(
@@ -277,7 +306,8 @@ public final class PromptCache {
     /// cannot distinguish "these prompts share nothing" from "they shared 690
     /// tokens and this cache cannot be rewound".
     public func adopt(
-        _ newTokens: [Int], maxKVSize: Int?, minimumReuse: Int = 1
+        _ newTokens: [Int], maxKVSize: Int?, minimumReuse: Int = 1,
+        allowsMixedGeometry: Bool = false
     ) -> PromptCacheAdoption {
         let held = tokens.count
         func refuse(
@@ -292,8 +322,8 @@ public final class PromptCache {
         guard !caches.isEmpty, Self.tokenCount(of: caches) == tokens.count else {
             return refuse(.brokenInvariant)
         }
-        guard !Self.hasRotated(caches) else { return refuse(.rotated) }
-        guard !Self.hasMixedWindowGeometry(caches) else {
+        guard !Self.hasRotated(caches, maxKVSize: maxKVSize) else { return refuse(.rotated) }
+        guard allowsMixedGeometry || !Self.hasMixedWindowGeometry(caches) else {
             return refuse(.mixedWindowGeometry)
         }
 

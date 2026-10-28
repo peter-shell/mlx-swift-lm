@@ -509,3 +509,194 @@ func testHybridRefusesAnythingButAPureExtension() throws {
     #expect(adoption.commonPrefix == 3)
     #expect(adoption.cachedTokens == 6)
 }
+
+// MARK: - LFM: conv state, sliding windows, and the geometry guard
+
+/// LFM2 shape: conv state beside full attention rotating at `maxKVSize`.
+private func lfm2ShapedCaches(maxKVSize: Int, tokens: Int) -> [KVCache] {
+    let caches: [KVCache] = [
+        MambaCache(), RotatingKVCache(maxSize: maxKVSize, keep: 4),
+        MambaCache(), RotatingKVCache(maxSize: maxKVSize, keep: 4),
+    ]
+    let keys = MLXArray.ones([1, 8, tokens, 64], dtype: .bfloat16)
+    let values = MLXArray.ones([1, 8, tokens, 64], dtype: .bfloat16)
+    for cache in caches {
+        switch cache {
+        case let arrays as ArraysCache:
+            arrays[0] = keys
+            arrays[1] = values
+        default:
+            _ = cache.update(keys: keys, values: values)
+        }
+    }
+    return caches
+}
+
+@Test
+func testRecurrentStateIsNotAGeometry() throws {
+    // A MambaCache takes no mask and reports no ceiling. Counting it as a
+    // geometry made every LFM array read as mixed once its attention began
+    // rotating at maxKVSize, and LFM2.5 lost the snapshot reuse it had.
+    let caches = lfm2ShapedCaches(maxKVSize: 512, tokens: 6)
+    #expect(!PromptCache.hasMixedWindowGeometry(caches))
+
+    let snapshot = try #require(
+        PromptCache.snapshotting(
+            promptTokens: [1, 2, 3, 4, 5, 6], caches: caches, maxKVSize: 512))
+    #expect(snapshot.adopt([1, 2, 3, 4, 5, 6, 7], maxKVSize: 512).prefix == 6)
+}
+
+@Test
+func testInterleavedAttentionNeedsTheOptIn() {
+    // LFM3 shape: conv, a sliding window, and full attention at the ceiling.
+    // Two attention geometries remain once conv state is set aside, so the
+    // array is refused unless the model says it masks each one from its own
+    // cache.
+    let caches: [KVCache] = [
+        MambaCache(), RotatingKVCache(maxSize: 16, keep: 0),
+        RotatingKVCache(maxSize: 512, keep: 4),
+    ]
+    feed(Array(caches[1...]), tokens: 6)
+    let prompt = [1, 2, 3, 4, 5, 6]
+
+    #expect(PromptCache.hasMixedWindowGeometry(caches))
+    #expect(
+        PromptCache.snapshotting(promptTokens: prompt, caches: caches, maxKVSize: 512)
+            == nil)
+    #expect(
+        PromptCache(tokens: prompt, caches: caches, maxKVSize: 512)
+            .adopt(prompt + [7], maxKVSize: 512).refusal == .mixedWindowGeometry)
+
+    let snapshot = PromptCache.snapshotting(
+        promptTokens: prompt, caches: caches, maxKVSize: 512,
+        allowsMixedGeometry: true)
+    #expect(snapshot != nil)
+    #expect(
+        snapshot?.adopt(prompt + [7], maxKVSize: 512, allowsMixedGeometry: true).prefix
+            == 6)
+}
+
+@Test
+func testSlidingWindowRotationBelowTheCeilingIsNotLoss() {
+    // A window the model chose rotates by design; attention there never reads
+    // past it. Only rotation at the requested ceiling drops tokens a layer
+    // would have read.
+    let window = RotatingKVCache(maxSize: 16, keep: 0)
+    feed([window], tokens: 40)
+    #expect(PromptCache.hasRotated([window]))
+    #expect(!PromptCache.hasRotated([window], maxKVSize: 512))
+    #expect(!window.isTrimmable, "a rotated window can only be extended")
+
+    let ceiling = RotatingKVCache(maxSize: 32, keep: 4)
+    feed([ceiling], tokens: 40)
+    #expect(PromptCache.hasRotated([ceiling], maxKVSize: 32))
+
+    // A window clamped to the ceiling is indistinguishable from the ceiling,
+    // so it is refused.
+    #expect(PromptCache.hasRotated([window], maxKVSize: 16))
+}
+
+private func lfm2EquivalenceModel() throws -> LFM2Model {
+    let json = """
+        {
+            "vocab_size": 100,
+            "hidden_size": 32,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "norm_eps": 1e-5,
+            "block_ff_dim": 64,
+            "block_auto_adjust_ff_dim": false,
+            "layer_types": ["conv", "full_attention", "conv", "full_attention"]
+        }
+        """
+    return LFM2Model(
+        try JSONDecoder().decode(LFM2Configuration.self, from: Data(json.utf8)))
+}
+
+private func lfm3EquivalenceModel(slidingWindow: Int) throws -> LFM3Model {
+    let json = """
+        {
+            "vocab_size": 100,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "norm_eps": 1e-5,
+            "layer_types": ["conv", "full_attention", "conv", "sliding_attention",
+                            "conv", "sliding_attention"],
+            "sliding_window": \(slidingWindow),
+            "rope_parameters": {
+                "full_attention": {"rope_theta": 10000.0},
+                "sliding_attention": {"rope_theta": 10000.0}
+            }
+        }
+        """
+    return LFM3Model(
+        try JSONDecoder().decode(LFM3Configuration.self, from: Data(json.utf8)))
+}
+
+/// Snapshot a hybrid after `prefixLength` tokens, extend it to `prompt`, and
+/// compare every suffix position's logits with one cold forward pass — what a
+/// tool hop does, end to end.
+///
+/// Logits, not generated tokens. On a tiny random model the argmax of the last
+/// position survives a wrong mask: a sliding mask built from a nil cache, which
+/// lets each query read past its window, still generated the cold tokens.
+private func snapshotExtensionDivergence(
+    model: any LLMModel, prompt: [Int], prefixLength: Int,
+    allowsMixedGeometry: Bool
+) throws -> (divergence: Float, reused: Int) {
+    let parameters = GenerateParameters(maxKVSize: 512, temperature: 0)
+    let cold = model(
+        MLXArray(prompt)[.newAxis], cache: model.newCache(parameters: parameters))
+
+    let caches = model.newCache(parameters: parameters)
+    let prefix = Array(prompt[..<prefixLength])
+    eval(model(MLXArray(prefix)[.newAxis], cache: caches))
+    #expect(PromptCache.requiresSnapshot(caches))
+    let snapshot = try #require(
+        PromptCache.snapshotting(
+            promptTokens: prefix, caches: caches, maxKVSize: parameters.maxKVSize,
+            allowsMixedGeometry: allowsMixedGeometry))
+    // keep running the original caches; the snapshot must not follow
+    eval(model(MLXArray([1, 2])[.newAxis], cache: caches))
+
+    let reused = snapshot.adopt(
+        prompt, maxKVSize: parameters.maxKVSize,
+        allowsMixedGeometry: allowsMixedGeometry
+    ).prefix
+    let warm = model(
+        MLXArray(Array(prompt[reused...]))[.newAxis], cache: snapshot.caches)
+
+    let divergence = abs(warm - cold[0..., reused..., 0...]).max().item(Float.self)
+    return (divergence, reused)
+}
+
+@Test
+func testLFM2SnapshotExtensionMatchesAColdPrefill() throws {
+    let prompt = (0 ..< 24).map { ($0 * 7 + 3) % 97 }
+    let result = try snapshotExtensionDivergence(
+        model: try lfm2EquivalenceModel(), prompt: prompt, prefixLength: 16,
+        allowsMixedGeometry: false)
+    #expect(result.reused == 16)
+    #expect(result.divergence < 1e-4)
+}
+
+/// The test the LFM3 opt-in rests on. The prefix is longer than the sliding
+/// window, so those layers have rotated before the snapshot, and the extension
+/// starts a forward pass at a non-zero offset with two mask geometries — the
+/// conditions under which Gemma 3n built a no-cache mask and died. Breaking
+/// LFM3's sliding mask that way fails this test.
+@Test
+func testLFM3SnapshotExtensionMatchesAColdPrefill() throws {
+    let model = try lfm3EquivalenceModel(slidingWindow: 16)
+    #expect((model as Any) is MasksEachCacheGeometry)
+
+    let prompt = (0 ..< 48).map { ($0 * 7 + 3) % 97 }
+    let result = try snapshotExtensionDivergence(
+        model: model, prompt: prompt, prefixLength: 32, allowsMixedGeometry: true)
+    #expect(result.reused == 32)
+    #expect(result.divergence < 1e-4)
+}
