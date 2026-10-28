@@ -100,6 +100,22 @@ public struct LFM2MoEConfiguration: Codable, Sendable {
         self._fullAttnIdxs = try container.decodeIfPresent([Int].self, forKey: ._fullAttnIdxs)
         self.layerTypes = try container.decodeIfPresent([String].self, forKey: .layerTypes)
     }
+
+    /// Full attention honors `maxKVSize`. Conv layers stay a fixed-size
+    /// `MambaCache`, which is not a token cache.
+    public func makeCache(parameters: GenerateParameters?) -> [KVCache] {
+        (0 ..< hiddenLayers).map { layerIdx in
+            if fullAttnIdxs.contains(layerIdx) {
+                if let maxKVSize = parameters?.maxKVSize {
+                    RotatingKVCache(maxSize: maxKVSize, keep: 4)
+                } else {
+                    KVCacheSimple()
+                }
+            } else {
+                MambaCache()
+            }
+        }
+    }
 }
 
 class LFM2MoEAttention: Module {
@@ -486,13 +502,7 @@ public class LFM2MoEModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        (0 ..< configuration.hiddenLayers).map { layerIdx in
-            if configuration.fullAttnIdxs.contains(layerIdx) {
-                KVCacheSimple()
-            } else {
-                MambaCache()
-            }
-        }
+        configuration.makeCache(parameters: parameters)
     }
 }
 

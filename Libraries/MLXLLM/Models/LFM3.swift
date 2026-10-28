@@ -110,6 +110,27 @@ public struct LFM3Configuration: Codable, Sendable {
 
     func isAttention(_ layerIdx: Int) -> Bool { layerTypes[layerIdx] != "conv" }
     func isSliding(_ layerIdx: Int) -> Bool { layerTypes[layerIdx] == "sliding_attention" }
+
+    /// Full attention honors `maxKVSize`. Sliding attention keeps its window,
+    /// capped by that ceiling when the ceiling is tighter. Conv layers stay a
+    /// fixed-size `MambaCache`.
+    public func makeCache(parameters: GenerateParameters?) -> [KVCache] {
+        (0 ..< hiddenLayers).map { layerIdx -> KVCache in
+            switch layerTypes[layerIdx] {
+            case "conv":
+                return MambaCache()
+            case "sliding_attention":
+                let window = slidingWindow
+                let maxSize = parameters?.maxKVSize.map { min(window, $0) } ?? window
+                return RotatingKVCache(maxSize: maxSize, keep: 0)
+            default:
+                if let maxKVSize = parameters?.maxKVSize {
+                    return RotatingKVCache(maxSize: maxKVSize, keep: 4)
+                }
+                return KVCacheSimple()
+            }
+        }
+    }
 }
 
 /// RoPE with LFM3's zero-tail partial rotation.
@@ -400,16 +421,7 @@ public class LFM3Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        (0 ..< configuration.hiddenLayers).map { layerIdx -> KVCache in
-            switch configuration.layerTypes[layerIdx] {
-            case "conv":
-                return MambaCache()
-            case "sliding_attention":
-                return RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
-            default:
-                return KVCacheSimple()
-            }
-        }
+        configuration.makeCache(parameters: parameters)
     }
 }
 

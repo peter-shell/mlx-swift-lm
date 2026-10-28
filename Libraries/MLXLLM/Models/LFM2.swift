@@ -102,6 +102,22 @@ public struct LFM2Configuration: Codable, Sendable {
         let ropeTheta = try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 1000000.0
         self.ropeTheta = ropeParameters?["rope_theta"]?.asFloat() ?? ropeTheta
     }
+
+    /// Full attention honors `maxKVSize`. Conv layers stay a fixed-size
+    /// `MambaCache`, which is not a token cache.
+    public func makeCache(parameters: GenerateParameters?) -> [KVCache] {
+        (0 ..< hiddenLayers).map { layerIdx in
+            if fullAttnIdxs.contains(layerIdx) {
+                if let maxKVSize = parameters?.maxKVSize {
+                    RotatingKVCache(maxSize: maxKVSize, keep: 4)
+                } else {
+                    KVCacheSimple()
+                }
+            } else {
+                MambaCache()
+            }
+        }
+    }
 }
 
 class LFM2Attention: Module {
@@ -402,13 +418,7 @@ public class LFM2Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        (0 ..< configuration.hiddenLayers).map { layerIdx in
-            if configuration.fullAttnIdxs.contains(layerIdx) {
-                KVCacheSimple()
-            } else {
-                MambaCache()
-            }
-        }
+        configuration.makeCache(parameters: parameters)
     }
 }
 
