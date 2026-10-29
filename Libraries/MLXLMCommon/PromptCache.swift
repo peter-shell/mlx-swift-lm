@@ -527,13 +527,13 @@ public final class PromptCacheSlots {
     /// The base when there is one — the last hop's prompt held this turn's tool
     /// calls, which the next turn never replays — otherwise the last cache, which
     /// a rewindable model trims to whatever the next turn shares. Dropped when it
-    /// holds more than `maxIdleTokens`.
+    /// holds more than `maxIdleTokens`. A kept base stays in its own slot, so the
+    /// generation it serves next reports it as the turn base.
     public func settle(maxIdleTokens: Int) {
-        let keep = turnBase ?? latest
-        turnBase = nil
-        if let keep, keep.tokenCount <= maxIdleTokens {
-            latest = keep
-        } else {
+        if let base = turnBase {
+            latest = nil
+            turnBase = base.tokenCount <= maxIdleTokens ? base : nil
+        } else if let last = latest, last.tokenCount > maxIdleTokens {
             latest = nil
         }
     }

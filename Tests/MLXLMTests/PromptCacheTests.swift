@@ -843,8 +843,8 @@ func testSettlingATurnKeepsTheBase() throws {
     let slots = PromptCacheSlots(latest: try hybridSnapshot([1, 2, 3, 4, 5, 6, 7]), turnBase: base)
 
     slots.settle(maxIdleTokens: 100)
-    #expect(slots.latest === base)
-    #expect(slots.turnBase == nil)
+    #expect(slots.turnBase === base)
+    #expect(slots.latest == nil)
 
     slots.settle(maxIdleTokens: 3)
     #expect(slots.isEmpty, "a cache too large to sit idle is dropped")
@@ -857,6 +857,8 @@ func testSettlingWithoutABaseKeepsTheLastCache() throws {
     let slots = PromptCacheSlots(latest: last)
     slots.settle(maxIdleTokens: 3)
     #expect(slots.latest === last)
+    slots.settle(maxIdleTokens: 2)
+    #expect(slots.isEmpty)
 }
 
 /// A tool turn followed by a new turn, end to end on an LFM3-shaped model.
@@ -903,6 +905,7 @@ func testLFM3TurnBaseAfterAToolHopMatchesAColdPrefill() throws {
         for: nextTurn, maxKVSize: parameters.maxKVSize, allowsMixedGeometry: true,
         isTurnBase: true)
     #expect(turn2.adoption.prefix == base.count)
+    #expect(turn2.servedFromTurnBase, "the next turn reads as served by the base")
     let warmCache = try #require(turn2.cache)
     let warm = model(
         MLXArray(Array(nextTurn[base.count...]))[.newAxis], cache: warmCache.caches)
