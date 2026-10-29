@@ -700,3 +700,215 @@ func testLFM3SnapshotExtensionMatchesAColdPrefill() throws {
     #expect(result.reused == 32)
     #expect(result.divergence < 1e-4)
 }
+
+// MARK: - the turn's base prompt beside its last hop
+
+@Test
+func testPreviewDecidesWhatAdoptDoesAndChangesNothing() throws {
+    let cache = PromptCache(
+        tokens: [1, 2, 3, 4, 5, 6], caches: simpleCaches(2, tokens: 6), maxKVSize: nil)
+
+    let preview = cache.preview([1, 2, 3, 9], maxKVSize: nil)
+    #expect(preview.prefix == 3)
+    #expect(cache.tokenCount == 6, "a preview must not rewind")
+    #expect(PromptCache.tokenCount(of: cache.caches) == 6)
+
+    #expect(cache.adopt([1, 2, 3, 9], maxKVSize: nil) == preview)
+    #expect(cache.tokenCount == 3)
+}
+
+@Test
+func testExtendingADuplicateLeavesTheOriginalAlone() throws {
+    let base = try #require(
+        PromptCache.snapshotting(
+            promptTokens: [1, 2, 3, 4, 5, 6], caches: nemotronShapedCaches(tokens: 6),
+            maxKVSize: nil))
+    let before = base.caches.map { $0.state.map { $0.sum().item(Float.self) } }
+
+    let copy = base.duplicate()
+    let keys = MLXArray.zeros([1, 8, 2, 64], dtype: .bfloat16)
+    for cache in copy.caches {
+        if let arrays = cache as? ArraysCache {
+            arrays[0] = keys
+            arrays[1] = keys
+        } else {
+            _ = cache.update(keys: keys, values: keys)
+        }
+    }
+
+    #expect(PromptCache.tokenCount(of: copy.caches) == 8)
+    #expect(PromptCache.tokenCount(of: base.caches) == 6)
+    #expect(base.caches.map { $0.state.map { $0.sum().item(Float.self) } } == before)
+}
+
+private func hybridSnapshot(_ prompt: [Int]) throws -> PromptCache {
+    try #require(
+        PromptCache.snapshotting(
+            promptTokens: prompt, caches: nemotronShapedCaches(tokens: prompt.count),
+            maxKVSize: nil))
+}
+
+@Test
+func testANewTurnFallsBackToTheTurnBase() throws {
+    // Turn 1: hop 0 is the base prompt, hop 1 appended a tool call and result.
+    let base = [1, 2, 3, 4]
+    let lastHop = base + [50, 51, 52]
+    let slots = PromptCacheSlots(latest: try hybridSnapshot(lastHop), turnBase: try hybridSnapshot(base))
+
+    // Turn 2 replays the question and the answer, never the tool exchange.
+    let selection = slots.take(
+        for: base + [60, 61, 62], maxKVSize: nil, isTurnBase: true)
+
+    #expect(selection.adoption.prefix == 4)
+    #expect(selection.servedFromTurnBase)
+    #expect(slots.isEmpty, "a turn-base generation replaces both slots")
+}
+
+@Test
+func testARefusalReportsTheLongestAgreement() throws {
+    let slots = PromptCacheSlots(
+        latest: try hybridSnapshot([1, 2, 3, 4, 5, 6]),
+        turnBase: try hybridSnapshot([1, 2, 7, 8]))
+
+    let selection = slots.take(for: [1, 2, 3, 4, 9, 9, 9], maxKVSize: nil, isTurnBase: false)
+
+    #expect(selection.cache == nil)
+    #expect(selection.adoption.refusal == .notTrimmable)
+    #expect(selection.adoption.commonPrefix == 4)
+    #expect(selection.adoption.cachedTokens == 6)
+    #expect(slots.turnBase != nil, "a refused hop does not cost the base")
+}
+
+@Test
+func testAHopThatExtendsTheBaseServesThroughACopy() throws {
+    // A single-hop turn's snapshot is both slots. The next hop of the same turn
+    // extends it, and the base must still be there when the turn ends.
+    let snapshot = try hybridSnapshot([1, 2, 3, 4])
+    let slots = PromptCacheSlots(latest: snapshot, turnBase: snapshot)
+
+    let selection = slots.take(for: [1, 2, 3, 4, 5, 6], maxKVSize: nil, isTurnBase: false)
+
+    let served = try #require(selection.cache)
+    #expect(served !== snapshot)
+    #expect(!selection.servedFromTurnBase, "the base and the last hop were one prompt")
+    #expect(slots.turnBase === snapshot)
+    #expect(slots.latest == nil)
+}
+
+@Test
+func testATurnBaseHopAdoptsWithoutACopy() throws {
+    let snapshot = try hybridSnapshot([1, 2, 3, 4])
+    let slots = PromptCacheSlots(latest: snapshot, turnBase: snapshot)
+
+    let selection = slots.take(for: [1, 2, 3, 4, 5, 6], maxKVSize: nil, isTurnBase: true)
+
+    #expect(selection.cache === snapshot)
+}
+
+@Test
+func testOnlyASnapshotBecomesTheTurnBase() throws {
+    let slots = PromptCacheSlots()
+    let hybrid = try hybridSnapshot([1, 2, 3])
+    slots.retain(hybrid, isTurnBase: true)
+    #expect(slots.turnBase === hybrid)
+    #expect(slots.latest === hybrid)
+
+    let later = try hybridSnapshot([1, 2, 3, 4, 5])
+    slots.retain(later, isTurnBase: false)
+    #expect(slots.turnBase === hybrid)
+    #expect(slots.latest === later)
+
+    // A rewindable cache trims to the base on its own, so it is never copied.
+    let trimmable = PromptCache(
+        tokens: [1, 2, 3], caches: simpleCaches(2, tokens: 3), maxKVSize: nil)
+    slots.retain(trimmable, isTurnBase: true)
+    #expect(slots.turnBase == nil)
+}
+
+@Test
+func testTheSnapshotBudgetDropsTheBaseFirst() throws {
+    let slots = PromptCacheSlots(
+        latest: try hybridSnapshot([1, 2, 3, 4, 5, 6]),
+        turnBase: try hybridSnapshot([1, 2, 3, 4]))
+
+    slots.makeRoom(forSnapshotOf: 8, snapshotMaxTokens: 12)
+    #expect(slots.turnBase != nil)
+    slots.makeRoom(forSnapshotOf: 9, snapshotMaxTokens: 12)
+    #expect(slots.turnBase == nil)
+}
+
+@Test
+func testSettlingATurnKeepsTheBase() throws {
+    let base = try hybridSnapshot([1, 2, 3, 4])
+    let slots = PromptCacheSlots(latest: try hybridSnapshot([1, 2, 3, 4, 5, 6, 7]), turnBase: base)
+
+    slots.settle(maxIdleTokens: 100)
+    #expect(slots.latest === base)
+    #expect(slots.turnBase == nil)
+
+    slots.settle(maxIdleTokens: 3)
+    #expect(slots.isEmpty, "a cache too large to sit idle is dropped")
+}
+
+@Test
+func testSettlingWithoutABaseKeepsTheLastCache() throws {
+    let last = PromptCache(
+        tokens: [1, 2, 3], caches: simpleCaches(2, tokens: 3), maxKVSize: nil)
+    let slots = PromptCacheSlots(latest: last)
+    slots.settle(maxIdleTokens: 3)
+    #expect(slots.latest === last)
+}
+
+/// A tool turn followed by a new turn, end to end on an LFM3-shaped model.
+///
+/// Turn 1's base prompt is snapshotted; its tool hop extends a copy of it; turn
+/// 2 then extends the base itself. Every suffix position of turn 2 must have the
+/// logits of a cold prefill — so the copy the tool hop ran on cannot have leaked
+/// into the base, sliding windows included.
+@Test
+func testLFM3TurnBaseAfterAToolHopMatchesAColdPrefill() throws {
+    let model = try lfm3EquivalenceModel(slidingWindow: 16)
+    let parameters = GenerateParameters(maxKVSize: 512, temperature: 0)
+    let base = (0 ..< 32).map { ($0 * 7 + 3) % 97 }
+    let toolHop = base + (0 ..< 12).map { ($0 * 11 + 5) % 97 }
+    let nextTurn = base + (0 ..< 14).map { ($0 * 13 + 1) % 97 }
+    let slots = PromptCacheSlots()
+
+    // Turn 1, hop 0: cold prefill, snapshot, then decode on the live cache.
+    let live0 = model.newCache(parameters: parameters)
+    eval(model(MLXArray(base)[.newAxis], cache: live0))
+    slots.retain(
+        try #require(
+            PromptCache.snapshotting(
+                promptTokens: base, caches: live0, maxKVSize: parameters.maxKVSize,
+                allowsMixedGeometry: true)),
+        isTurnBase: true)
+    eval(model(MLXArray([1, 2])[.newAxis], cache: live0))
+
+    // Hop 1: the tool exchange extends the base, on a copy.
+    let hop1 = slots.take(
+        for: toolHop, maxKVSize: parameters.maxKVSize, allowsMixedGeometry: true,
+        isTurnBase: false)
+    let hop1Cache = try #require(hop1.cache)
+    eval(model(MLXArray(Array(toolHop[hop1.adoption.prefix...]))[.newAxis], cache: hop1Cache.caches))
+    slots.retain(
+        PromptCache.snapshotting(
+            promptTokens: toolHop, caches: hop1Cache.caches,
+            maxKVSize: parameters.maxKVSize, allowsMixedGeometry: true),
+        isTurnBase: false)
+    slots.settle(maxIdleTokens: 512)
+
+    // Turn 2 extends the base, not the tool hop.
+    let turn2 = slots.take(
+        for: nextTurn, maxKVSize: parameters.maxKVSize, allowsMixedGeometry: true,
+        isTurnBase: true)
+    #expect(turn2.adoption.prefix == base.count)
+    let warmCache = try #require(turn2.cache)
+    let warm = model(
+        MLXArray(Array(nextTurn[base.count...]))[.newAxis], cache: warmCache.caches)
+    let cold = model(
+        MLXArray(nextTurn)[.newAxis], cache: model.newCache(parameters: parameters))
+
+    let divergence = abs(warm - cold[0..., base.count..., 0...]).max().item(Float.self)
+    #expect(divergence < 1e-4)
+}

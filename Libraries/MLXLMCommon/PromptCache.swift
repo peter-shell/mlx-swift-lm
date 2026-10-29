@@ -297,15 +297,13 @@ public final class PromptCache {
         )
     }
 
-    /// Prepare this cache to serve `newTokens`, rewinding it if needed.
+    /// What ``adopt(_:maxKVSize:minimumReuse:allowsMixedGeometry:)`` would do
+    /// for `newTokens`, without doing it.
     ///
-    /// On success `self` describes the cache truthfully again: `tokens` holds
-    /// the reused prefix and every cache's offset matches it. On a refusal the
-    /// caller should drop this cache and build a fresh one, and
-    /// ``PromptCacheAdoption/refusal`` says why — a zero prefix on its own
-    /// cannot distinguish "these prompts share nothing" from "they shared 690
-    /// tokens and this cache cannot be rewound".
-    public func adopt(
+    /// The same guards and the same plan, and nothing is trimmed or rewritten,
+    /// so a caller holding more than one cache can ask each before committing
+    /// to any. ``PromptCacheSlots`` is that caller.
+    public func preview(
         _ newTokens: [Int], maxKVSize: Int?, minimumReuse: Int = 1,
         allowsMixedGeometry: Bool = false
     ) -> PromptCacheAdoption {
@@ -327,18 +325,38 @@ public final class PromptCache {
             return refuse(.mixedWindowGeometry)
         }
 
-        let prefix: Int
         switch promptCacheReusePlan(
             cached: tokens,
             new: newTokens,
             canTrim: canTrimPromptCache(caches),
             minimumReuse: minimumReuse
         ) {
-        case .reuse(let p):
-            prefix = p
+        case .reuse(let prefix):
+            return PromptCacheAdoption(
+                prefix: prefix, cachedTokens: held,
+                commonPrefix: prefix, refusal: nil)
         case .fresh(let reason, let commonPrefix):
             return refuse(reason, commonPrefix: commonPrefix)
         }
+    }
+
+    /// Prepare this cache to serve `newTokens`, rewinding it if needed.
+    ///
+    /// On success `self` describes the cache truthfully again: `tokens` holds
+    /// the reused prefix and every cache's offset matches it. On a refusal the
+    /// caller should drop this cache and build a fresh one, and
+    /// ``PromptCacheAdoption/refusal`` says why — a zero prefix on its own
+    /// cannot distinguish "these prompts share nothing" from "they shared 690
+    /// tokens and this cache cannot be rewound".
+    public func adopt(
+        _ newTokens: [Int], maxKVSize: Int?, minimumReuse: Int = 1,
+        allowsMixedGeometry: Bool = false
+    ) -> PromptCacheAdoption {
+        let plan = preview(
+            newTokens, maxKVSize: maxKVSize, minimumReuse: minimumReuse,
+            allowsMixedGeometry: allowsMixedGeometry)
+        guard plan.didReuse else { return plan }
+        let prefix = plan.prefix
 
         let rewind = tokens.count - prefix
         if rewind > 0 {
@@ -348,13 +366,176 @@ public final class PromptCache {
                 // truthfully so nothing downstream trusts a stale count, and
                 // refuse the reuse.
                 tokens = Array(tokens[..<(tokens.count - trimmed)])
-                return refuse(.partialRewind, commonPrefix: prefix)
+                return PromptCacheAdoption(
+                    prefix: 0, cachedTokens: plan.cachedTokens,
+                    commonPrefix: prefix, refusal: .partialRewind)
             }
         }
         tokens = Array(newTokens[..<prefix])
-        return PromptCacheAdoption(
-            prefix: prefix, cachedTokens: held,
-            commonPrefix: prefix, refusal: nil)
+        return plan
+    }
+
+    /// An independent copy: the same tokens, every cache copied.
+    ///
+    /// The copy ``snapshotting(promptTokens:caches:maxKVSize:allowsMixedGeometry:)``
+    /// makes, taken of a cache that is already retained. Extending one never
+    /// moves the other, which is what lets a turn's base prompt serve a hop and
+    /// still be there for the next turn.
+    public func duplicate() -> PromptCache {
+        PromptCache(tokens: tokens, caches: caches.map { $0.copy() }, maxKVSize: maxKVSize)
+    }
+
+    /// Bytes the cache arrays hold, recurrent state included.
+    ///
+    /// Measured rather than estimated: a hybrid's state is a fixed size that no
+    /// bytes-per-token figure carries.
+    public var byteCount: Int {
+        caches.reduce(0) { sum, cache in
+            sum + cache.state.reduce(0) { $0 + $1.nbytes }
+        }
+    }
+}
+
+/// What ``PromptCacheSlots/take(for:maxKVSize:minimumReuse:allowsMixedGeometry:isTurnBase:)``
+/// handed a generation.
+public struct PromptCacheSelection {
+    /// The cache to prefill from, already adopted; nil when nothing reused.
+    public let cache: PromptCache?
+
+    /// What adopting it did — or, when nothing reused, the refusal of the
+    /// candidate whose prompt agreed for longest.
+    public let adoption: PromptCacheAdoption
+
+    /// Whether the turn's base prompt served this generation rather than the
+    /// last one.
+    public let servedFromTurnBase: Bool
+}
+
+/// The two caches a recurrent hybrid keeps: the last generation's prompt and
+/// the turn's **base** prompt.
+///
+/// A cache retained by snapshot can only be *extended*
+/// (``PromptCacheRefusal/notTrimmable``). A tool loop extends, so within a turn
+/// the last hop's cache is the one to offer. The next turn does not: its history
+/// replays the question and the answer, never the tool calls and results the
+/// last hop's prompt held. What the next turn does extend is the prompt the turn
+/// *started* from — system message, history, the question, the generation
+/// prompt — so that snapshot is kept beside the last one, offered whenever the
+/// last one cannot serve, and kept instead of it when the turn ends.
+///
+/// Only snapshots fill the base. A cache that can rewind reaches the base by
+/// trimming, unless its prompt changed at the front, and copying it would cost a
+/// pure-attention model many times what it costs a hybrid.
+///
+/// The two are often the same object: a single-hop turn's only snapshot is both.
+/// A copy is made only when a generation extends the base and the base must
+/// survive it.
+///
+/// Not `Sendable`, for the reason ``PromptCache`` is not.
+public final class PromptCacheSlots {
+    public private(set) var latest: PromptCache?
+    public private(set) var turnBase: PromptCache?
+
+    public init(latest: PromptCache? = nil, turnBase: PromptCache? = nil) {
+        self.latest = latest
+        self.turnBase = turnBase
+    }
+
+    public var isEmpty: Bool { latest == nil && turnBase == nil }
+
+    /// Pick the cache that serves `tokens`, adopt it, and move it out.
+    ///
+    /// The last generation's cache is tried first, then the turn's base. The
+    /// last one leaves the slots whatever happens: it is either serving this
+    /// generation or describes a prompt this one has moved past. The base stays
+    /// unless this generation starts a turn of its own, and when it is the cache
+    /// chosen it serves through a ``PromptCache/duplicate()``.
+    public func take(
+        for tokens: [Int], maxKVSize: Int?, minimumReuse: Int = 1,
+        allowsMixedGeometry: Bool = false, isTurnBase: Bool
+    ) -> PromptCacheSelection {
+        let latest = self.latest
+        let base = self.turnBase
+        self.latest = nil
+        // A generation that starts a turn replaces the base either way.
+        if isTurnBase { self.turnBase = nil }
+
+        func preview(_ cache: PromptCache) -> PromptCacheAdoption {
+            cache.preview(
+                tokens, maxKVSize: maxKVSize, minimumReuse: minimumReuse,
+                allowsMixedGeometry: allowsMixedGeometry)
+        }
+
+        var candidates: [(cache: PromptCache, plan: PromptCacheAdoption)] = []
+        if let latest { candidates.append((latest, preview(latest))) }
+        if let base, base !== latest { candidates.append((base, preview(base))) }
+
+        guard
+            let chosen = candidates.first(where: { $0.plan.didReuse })
+        else {
+            let longest = candidates.max { $0.plan.commonPrefix < $1.plan.commonPrefix }
+            return PromptCacheSelection(
+                cache: nil,
+                adoption: longest?.plan
+                    ?? PromptCacheAdoption(
+                        prefix: 0, cachedTokens: 0, commonPrefix: 0,
+                        refusal: nil),
+                servedFromTurnBase: false)
+        }
+
+        let isBase = chosen.cache === base
+        let cache =
+            isBase && self.turnBase != nil ? chosen.cache.duplicate() : chosen.cache
+        let adoption = cache.adopt(
+            tokens, maxKVSize: maxKVSize, minimumReuse: minimumReuse,
+            allowsMixedGeometry: allowsMixedGeometry)
+        return PromptCacheSelection(
+            cache: adoption.didReuse ? cache : nil,
+            adoption: adoption,
+            // Reported only when the base and the last cache were different
+            // prompts: a single-hop turn's snapshot is both.
+            servedFromTurnBase: adoption.didReuse && isBase && base !== latest)
+    }
+
+    /// Drop the base when it and a snapshot of `promptTokens` would not both fit
+    /// in `snapshotMaxTokens`.
+    ///
+    /// Called before the snapshot is taken, so the peak is what is bounded. The
+    /// base goes first: the snapshot about to be taken serves this turn's next
+    /// hop, which holds everything the base does and more.
+    public func makeRoom(forSnapshotOf promptTokens: Int, snapshotMaxTokens: Int) {
+        guard let base = turnBase else { return }
+        if base.tokenCount + promptTokens > snapshotMaxTokens { turnBase = nil }
+    }
+
+    /// Keep what the generation that just finished left behind.
+    ///
+    /// A snapshot from a generation that starts a turn becomes the base too.
+    public func retain(_ cache: PromptCache?, isTurnBase: Bool) {
+        latest = cache
+        guard isTurnBase else { return }
+        if let cache, PromptCache.requiresSnapshot(cache.caches) {
+            turnBase = cache
+        } else {
+            turnBase = nil
+        }
+    }
+
+    /// End a turn: keep the one cache the next turn can extend, if it may stay
+    /// resident at all.
+    ///
+    /// The base when there is one — the last hop's prompt held this turn's tool
+    /// calls, which the next turn never replays — otherwise the last cache, which
+    /// a rewindable model trims to whatever the next turn shares. Dropped when it
+    /// holds more than `maxIdleTokens`.
+    public func settle(maxIdleTokens: Int) {
+        let keep = turnBase ?? latest
+        turnBase = nil
+        if let keep, keep.tokenCount <= maxIdleTokens {
+            latest = keep
+        } else {
+            latest = nil
+        }
     }
 }
 
