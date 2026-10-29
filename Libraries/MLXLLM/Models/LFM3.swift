@@ -417,7 +417,33 @@ public class LFM3Model: Module, LLMModel, KVCacheDimensionProvider, MasksEachCac
             }
             sanitized[name] = param
         }
-        return sanitized
+        return dequantizingGates(sanitized)
+    }
+
+    /// Stores each attention gate unquantized.
+    ///
+    /// The gate has one output per head, 16 rows here, fewer than a 4-bit
+    /// matmul kernel reads in a block. On an A14 iPad (Apple GPU family 7) that
+    /// quantized matmul killed the process with a GPU page fault, intermittently,
+    /// as a read past the end of a 16 KB buffer would when the buffer ends a
+    /// mapped page; the same op is clean on M-series and every other LFM3 op is
+    /// clean on both. Dequantizing here, before the loader decides what to
+    /// quantize, leaves the gate a plain `Linear` with exactly the weights the
+    /// quantized one multiplied by, for about 64 KB per attention layer.
+    func dequantizingGates(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        var weights = weights
+        let suffix = "self_attn.gate_proj.weight"
+        for (name, packed) in weights where name.hasSuffix(suffix) {
+            let prefix = String(name.dropLast(".weight".count))
+            guard let scales = weights[prefix + ".scales"] else { continue }
+            let inputs = configuration.hiddenSize
+            weights[name] = dequantized(
+                packed, scales: scales, biases: weights[prefix + ".biases"],
+                groupSize: inputs / scales.dim(-1), bits: packed.dim(-1) * 32 / inputs)
+            weights[prefix + ".scales"] = nil
+            weights[prefix + ".biases"] = nil
+        }
+        return weights
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
