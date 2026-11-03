@@ -103,6 +103,14 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for frequency penalty
     public var frequencyContextSize: Int
 
+    /// Token ids that may not be sampled at all: their logits are set to
+    /// negative infinity after every penalty. Empty by default.
+    ///
+    /// Lets a caller keep a prompt byte-identical (so a cached prefix is
+    /// reused) while ruling out a continuation, such as a tool call's opening
+    /// special token on a hop whose calls will not be run.
+    public var suppressedTokens: [Int]
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -119,6 +127,7 @@ public struct GenerateParameters: Sendable {
         presenceContextSize: Int = 20,
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
+        suppressedTokens: [Int] = [],
         prefillStepSize: Int = 512
     ) {
         self.maxTokens = maxTokens
@@ -136,6 +145,7 @@ public struct GenerateParameters: Sendable {
         self.presenceContextSize = presenceContextSize
         self.frequencyPenalty = frequencyPenalty
         self.frequencyContextSize = frequencyContextSize
+        self.suppressedTokens = suppressedTokens
         self.prefillStepSize = prefillStepSize
     }
 
@@ -184,14 +194,20 @@ public struct GenerateParameters: Sendable {
             frequencyContext = nil
         }
 
-        if repetitionContext == nil && presenceContext == nil && frequencyContext == nil {
+        let suppression = suppressedTokens.isEmpty
+            ? nil : SuppressTokensProcessor(tokens: suppressedTokens)
+
+        if repetitionContext == nil && presenceContext == nil && frequencyContext == nil
+            && suppression == nil
+        {
             return nil
         }
 
         return PenaltyProcessor(
             repetitionContext: repetitionContext,
             presenceContext: presenceContext,
-            frequencyContext: frequencyContext
+            frequencyContext: frequencyContext,
+            suppression: suppression
         )
     }
 }
@@ -502,20 +518,46 @@ public struct FrequencyPenaltyContext: LogitProcessor {
     }
 }
 
-/// Processor that composes penalty processors in Python mlx-lm order.
+/// Processor that rules out a fixed set of token ids: their logits become
+/// negative infinity, so no sampler can choose them.
+///
+/// Applied last, after every penalty, so a penalty cannot lift a suppressed
+/// token back into reach.
+public struct SuppressTokensProcessor: LogitProcessor {
+    let indices: MLXArray
+
+    public init(tokens: [Int]) {
+        self.indices = MLXArray(tokens.map { UInt32($0) })
+    }
+
+    public mutating func prompt(_ prompt: MLXArray) {}
+
+    public func process(logits: MLXArray) -> MLXArray {
+        logits[0..., indices] = MLXArray(-Float.infinity).asType(logits.dtype)
+        return logits
+    }
+
+    public mutating func didSample(token: MLXArray) {}
+}
+
+/// Processor that composes penalty processors in Python mlx-lm order, then
+/// any token suppression.
 public struct PenaltyProcessor: LogitProcessor {
     var repetitionContext: RepetitionContext?
     var presenceContext: PresencePenaltyContext?
     var frequencyContext: FrequencyPenaltyContext?
+    var suppression: SuppressTokensProcessor?
 
     public init(
         repetitionContext: RepetitionContext?,
         presenceContext: PresencePenaltyContext?,
-        frequencyContext: FrequencyPenaltyContext?
+        frequencyContext: FrequencyPenaltyContext?,
+        suppression: SuppressTokensProcessor? = nil
     ) {
         self.repetitionContext = repetitionContext
         self.presenceContext = presenceContext
         self.frequencyContext = frequencyContext
+        self.suppression = suppression
     }
 
     mutating public func prompt(_ prompt: MLXArray) {
@@ -529,6 +571,7 @@ public struct PenaltyProcessor: LogitProcessor {
         logits = repetitionContext?.process(logits: logits) ?? logits
         logits = presenceContext?.process(logits: logits) ?? logits
         logits = frequencyContext?.process(logits: logits) ?? logits
+        logits = suppression?.process(logits: logits) ?? logits
         return logits
     }
 

@@ -30,6 +30,35 @@ public class SampleTests: XCTestCase {
         }
     }
 
+    func testSuppressedTokenIsNeverSampled() {
+        // Token 2 carries almost all the mass; suppressed, the argmax moves on.
+        let logits = MLXArray([0.0, 1.0, 9.0, 2.0] as [Float]).reshaped([1, 4])
+        let parameters = GenerateParameters(temperature: 0, suppressedTokens: [2])
+        let processor = parameters.processor()
+        XCTAssertNotNil(processor)
+        let processed = processor!.process(logits: logits)
+        XCTAssertEqual(parameters.sampler().sample(logits: processed).item(Int.self), 3)
+        XCTAssertEqual(processed[0, 2].item(Float.self), -Float.infinity)
+        // The other logits are untouched.
+        XCTAssertEqual(processed[0, 3].item(Float.self), 2.0)
+    }
+
+    func testSuppressionAppliesAfterRepetitionPenalty() {
+        // A repetition penalty must not lift a suppressed token back into reach.
+        let logits = MLXArray([0.0, 1.0, 9.0, 2.0] as [Float]).reshaped([1, 4])
+        let parameters = GenerateParameters(
+            temperature: 0, repetitionPenalty: 1.5, suppressedTokens: [2])
+        var processor = parameters.processor()!
+        processor.prompt(MLXArray([2, 3] as [Int32]))
+        let processed = processor.process(logits: logits)
+        XCTAssertEqual(processed[0, 2].item(Float.self), -Float.infinity)
+        XCTAssertEqual(parameters.sampler().sample(logits: processed).item(Int.self), 3)
+    }
+
+    func testNoSuppressionKeepsNoProcessor() {
+        XCTAssertNil(GenerateParameters().processor())
+    }
+
     func testTopKSamplerKeepsOnlyTopToken() {
         let sampler = TopPSampler(temperature: 1.0, topK: 1)
         let logits = MLXArray([0.1 as Float, 2.0 as Float, 1.0 as Float])[.newAxis, .ellipsis]
