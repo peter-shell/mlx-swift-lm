@@ -28,7 +28,7 @@ import Tokenizers
 
 // MARK: - Text backbone (private copy of LFM3)
 
-private enum OmniText {
+enum OmniText {
 
     final class RoPE: Module {
         let dims: Int
@@ -705,6 +705,9 @@ public class LFM3Omni: Module, VLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "audio_projector") private var audioProjector: OmniAudio.Projector
 
     public let config: LFM3OmniConfiguration
+
+    /// The speech path (`LFM3OmniSpeech`) reads the backbone directly.
+    var speechLanguageModel: OmniText.LanguageModel { languageModel }
 
     /// Added to every logit row so text generation never picks a placeholder
     /// (image, video, audio, prior speech) the prompt alone may carry.
