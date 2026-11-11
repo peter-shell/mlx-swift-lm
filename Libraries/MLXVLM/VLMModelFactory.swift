@@ -99,6 +99,7 @@ public enum VLMTypeRegistry {
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
+        "lfm3_omni": create(LFM3OmniConfiguration.self, LFM3Omni.init),
     ])
 }
 
@@ -130,6 +131,8 @@ public enum VLMProcessorTypeRegistry {
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
         "Glm46VProcessor": create(
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
+        "Lfm3OmniProcessor": create(
+            LFM3OmniProcessorConfiguration.self, LFM3OmniProcessor.init),
     ])
 }
 
