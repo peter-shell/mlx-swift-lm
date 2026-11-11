@@ -75,6 +75,14 @@ public struct UserInput {
         }
     }
 
+    /// Representation of an audio resource: a file any `AVAudioFile` reads, or
+    /// mono samples already decoded. A processor resamples either to the rate
+    /// its model needs.
+    public enum Audio {
+        case url(URL)
+        case samples([Float], sampleRate: Double)
+    }
+
     /// Representation of an image resource.
     public enum Image {
         case ciImage(CIImage)
@@ -162,6 +170,9 @@ public struct UserInput {
                 self.videos = messages.reduce(into: []) { result, message in
                     result.append(contentsOf: message.videos)
                 }
+                self.audios = messages.reduce(into: []) { result, message in
+                    result.append(contentsOf: message.audios)
+                }
             }
         }
     }
@@ -177,6 +188,10 @@ public struct UserInput {
     /// If the ``prompt-swift.property`` is a ``Prompt-swift.enum/chat(_:)`` this will
     /// collect the videos from the chat messages, otherwise these are the stored videos with the ``UserInput``.
     public var videos = [Video]()
+
+    /// The input audio clips, in the order a processor places them. Collected
+    /// from the messages, as images are, when the prompt is `.chat`.
+    public var audios = [Audio]()
 
     public var tools: [ToolSpec]?
 
@@ -289,6 +304,9 @@ public struct UserInput {
         }
         self.videos = chat.reduce(into: []) { result, message in
             result.append(contentsOf: message.videos)
+        }
+        self.audios = chat.reduce(into: []) { result, message in
+            result.append(contentsOf: message.audios)
         }
 
         self.processing = processing

@@ -9,7 +9,26 @@ import Foundation
 /// reaches a log or a trace as a bare zero, and the zeroes mean very different
 /// things. ``notTrimmable`` in particular is a *structural* refusal that no
 /// amount of prompt tuning removes.
+/// A prompt cache used where the rules say it must not be.
+public enum PromptCacheError: LocalizedError, Equatable {
+    /// A prompt carrying media was given a cached prefix
+    /// (``LMInput/carriesMedia``).
+    case mediaPrompt
+
+    public var errorDescription: String? {
+        switch self {
+        case .mediaPrompt:
+            return "A prompt carrying media cannot be served from a prompt cache."
+        }
+    }
+}
+
 public enum PromptCacheRefusal: String, Equatable, Sendable {
+    /// The prompt carries media (``LMInput/carriesMedia``). Placeholder tokens
+    /// are the same ids whatever the media shows, so a cache keyed on token ids
+    /// cannot tell one image or clip from another.
+    case carriesMedia
+
     /// The cache is empty, or the new prompt is too short to leave a token to
     /// feed the model once anything is reused.
     case nothingToReuse
@@ -259,8 +278,10 @@ public final class PromptCache {
     /// tokens than the prompt, or when they have rotated.
     public static func retaining(
         promptTokens: [Int], caches: [KVCache], maxKVSize: Int?,
-        allowsMixedGeometry: Bool = false
+        allowsMixedGeometry: Bool = false, carriesMedia: Bool = false
     ) -> PromptCache? {
+        // A prompt with media is never retained (``LMInput/carriesMedia``).
+        guard !carriesMedia else { return nil }
         guard !caches.isEmpty, !promptTokens.isEmpty else { return nil }
         guard !hasRotated(caches, maxKVSize: maxKVSize), canTrimPromptCache(caches)
         else { return nil }
@@ -283,8 +304,9 @@ public final class PromptCache {
     /// prefill, before any token is decoded. Returns nil if they do not.
     public static func snapshotting(
         promptTokens: [Int], caches: [KVCache], maxKVSize: Int?,
-        allowsMixedGeometry: Bool = false
+        allowsMixedGeometry: Bool = false, carriesMedia: Bool = false
     ) -> PromptCache? {
+        guard !carriesMedia else { return nil }
         guard !caches.isEmpty, !promptTokens.isEmpty else { return nil }
         guard !hasRotated(caches, maxKVSize: maxKVSize) else { return nil }
         guard allowsMixedGeometry || !hasMixedWindowGeometry(caches) else { return nil }
@@ -452,13 +474,24 @@ public final class PromptCacheSlots {
     /// chosen it serves through a ``PromptCache/duplicate()``.
     public func take(
         for tokens: [Int], maxKVSize: Int?, minimumReuse: Int = 1,
-        allowsMixedGeometry: Bool = false, isTurnBase: Bool
+        allowsMixedGeometry: Bool = false, isTurnBase: Bool, carriesMedia: Bool = false
     ) -> PromptCacheSelection {
         let latest = self.latest
         let base = self.turnBase
         self.latest = nil
         // A generation that starts a turn replaces the base either way.
         if isTurnBase { self.turnBase = nil }
+
+        // Media is never served from a cache. The last cache leaves the slots
+        // as it always does, since this prompt has moved past it.
+        if carriesMedia {
+            return PromptCacheSelection(
+                cache: nil,
+                adoption: PromptCacheAdoption(
+                    prefix: 0, cachedTokens: latest?.tokenCount ?? 0, commonPrefix: 0,
+                    refusal: .carriesMedia),
+                servedFromTurnBase: false)
+        }
 
         func preview(_ cache: PromptCache) -> PromptCacheAdoption {
             cache.preview(

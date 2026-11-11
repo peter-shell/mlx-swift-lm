@@ -737,11 +737,19 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         // ``init(input:model:cache:cachedPrefix:parameters:)``.
         processor?.prompt(input.text.tokens)
 
+        // Media is never served from a prompt cache (``LMInput/carriesMedia``).
+        // ``PromptCache`` refuses to retain or adopt for it; this is the
+        // backstop for a caller that built a cached prefix anyway.
+        if cachedPrefix > 0, input.carriesMedia {
+            throw PromptCacheError.mediaPrompt
+        }
+
         let pending = cachedPrefix > 0
             ? LMInput(
                 text: promptSuffix(input.text, cachedPrefix: cachedPrefix),
                 image: input.image,
-                video: input.video)
+                video: input.video,
+                audio: input.audio)
             : input
 
         switch try model.prepare(pending, cache: cache, windowSize: windowSize) {

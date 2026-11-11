@@ -14,14 +14,19 @@ public enum Chat {
         /// Array of video data associated with the message.
         public var videos: [UserInput.Video]
 
+        /// Audio clips that go with this message. A processor places them
+        /// before the text, as it places images.
+        public var audios: [UserInput.Audio]
+
         public init(
             role: Role, content: String, images: [UserInput.Image] = [],
-            videos: [UserInput.Video] = []
+            videos: [UserInput.Video] = [], audios: [UserInput.Audio] = []
         ) {
             self.role = role
             self.content = content
             self.images = images
             self.videos = videos
+            self.audios = audios
         }
 
         public static func system(
@@ -37,9 +42,10 @@ public enum Chat {
         }
 
         public static func user(
-            _ content: String, images: [UserInput.Image] = [], videos: [UserInput.Video] = []
+            _ content: String, images: [UserInput.Image] = [], videos: [UserInput.Video] = [],
+            audios: [UserInput.Audio] = []
         ) -> Self {
-            Self(role: .user, content: content, images: images, videos: videos)
+            Self(role: .user, content: content, images: images, videos: videos, audios: audios)
         }
 
         public static func tool(_ content: String) -> Self {

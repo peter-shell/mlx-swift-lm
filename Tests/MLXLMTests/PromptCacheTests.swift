@@ -915,3 +915,49 @@ func testLFM3TurnBaseAfterAToolHopMatchesAColdPrefill() throws {
     let divergence = abs(warm - cold[0..., base.count..., 0...]).max().item(Float.self)
     #expect(divergence < 1e-4)
 }
+
+// MARK: - media is never cached (LMInput.carriesMedia)
+
+@Test
+func testMediaPromptsAreNeverRetainedOrSnapshotted() {
+    let prompt = [1, 2, 3, 4, 5, 6]
+    #expect(
+        PromptCache.retaining(
+            promptTokens: prompt, caches: simpleCaches(2, tokens: 8), maxKVSize: nil,
+            carriesMedia: true) == nil)
+    #expect(
+        PromptCache.snapshotting(
+            promptTokens: prompt, caches: simpleCaches(2, tokens: 6), maxKVSize: nil,
+            carriesMedia: true) == nil)
+    // The same caches without media are kept, so the refusal is media's.
+    #expect(
+        PromptCache.retaining(
+            promptTokens: prompt, caches: simpleCaches(2, tokens: 8), maxKVSize: nil) != nil)
+}
+
+@Test
+func testSlotsRefuseAMediaPromptAndDropTheLastCache() throws {
+    let prompt = [1, 2, 3, 4, 5, 6]
+    let cache = try #require(
+        PromptCache.retaining(
+            promptTokens: prompt, caches: simpleCaches(2, tokens: 6), maxKVSize: nil))
+    let slots = PromptCacheSlots(latest: cache)
+    let selection = slots.take(
+        for: prompt + [7, 8], maxKVSize: nil, isTurnBase: false, carriesMedia: true)
+    #expect(selection.cache == nil)
+    #expect(selection.adoption.refusal == .carriesMedia)
+    #expect(slots.latest == nil)
+}
+
+@Test
+func testTokenIteratorRefusesACachedPrefixWithMedia() {
+    let model = equivalenceModel()
+    let image = LMInput.ProcessedImage(pixels: MLXArray.zeros([1, 4]), frames: [THW(1, 1, 1)])
+    let input = LMInput(text: .init(tokens: MLXArray([1, 2, 3, 4])), image: image)
+    #expect(input.carriesMedia)
+    #expect(throws: PromptCacheError.mediaPrompt) {
+        _ = try TokenIterator(
+            input: input, model: model, cache: model.newCache(parameters: nil),
+            cachedPrefix: 2, parameters: GenerateParameters(temperature: 0))
+    }
+}

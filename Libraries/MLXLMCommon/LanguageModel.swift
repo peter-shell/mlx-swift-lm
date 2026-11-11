@@ -38,6 +38,13 @@ public struct LMInput {
     public let text: Text
     public let image: ProcessedImage?
     public let video: ProcessedVideo?
+    public let audio: ProcessedAudio?
+
+    /// Whether any media rides with the tokens. A prompt that carries media is
+    /// never served from a prompt cache and never retained: its placeholder
+    /// tokens are the same ids whatever the media shows, so a cache keyed on
+    /// token ids would answer about the previous image or clip.
+    public var carriesMedia: Bool { image != nil || video != nil || audio != nil }
 
     /// Representation of tokenized input text.
     public struct Text {
@@ -97,17 +104,33 @@ public struct LMInput {
         }
     }
 
+    /// Representation of prepared input audio: one row of features per clip,
+    /// zero-padded to the longest, and each clip's valid frame count.
+    public struct ProcessedAudio {
+
+        /// Features, `[clips, featureSize, frames]`
+        public let features: MLXArray
+        /// Valid frames per clip, in order
+        public let lengths: [Int]
+
+        public init(features: MLXArray, lengths: [Int]) {
+            self.features = features
+            self.lengths = lengths
+        }
+    }
+
     public init(tokens: MLXArray, mask: MLXArray? = nil) {
         self.init(text: .init(tokens: tokens, mask: mask))
     }
 
     public init(
         text: LMInput.Text, image: LMInput.ProcessedImage? = nil,
-        video: LMInput.ProcessedVideo? = nil
+        video: LMInput.ProcessedVideo? = nil, audio: LMInput.ProcessedAudio? = nil
     ) {
         self.text = text
         self.image = image
         self.video = video
+        self.audio = audio
     }
 }
 
