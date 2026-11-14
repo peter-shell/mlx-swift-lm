@@ -10,12 +10,10 @@
 // Each case is one prompt mlx-vlm answered: a state as text, one or two
 // questions, the packed ids, and each answer's probabilities.
 //
-// The ids, the state's length and the question groups must be identical, with
-// one known exception, reported as `segmentation_gaps`: the same text split
-// into different tokens. LFM3's tokenizer.json sets BPE `ignore_merges`, which
-// swift-transformers honours only from 1.4.0 (#397). The fork pins 1.2.x, so a
-// word whole in the vocabulary (" Genehmigung") can split here and not in
-// Python. A gap case is still answered and must still pick the same option.
+// The ids, the state's length and the question groups must be identical. Until
+// the fork required swift-transformers 1.4.0, which honours LFM3's BPE
+// `ignore_merges` (#397), one case split " Genehmigung" into three tokens where
+// Python kept one, and this test let a same-text split through. It no longer does.
 //
 // Every answer must pick the same option. Each probability must be within 5e-3
 // of mlx-vlm's, and the median within 5e-4. The two sides run different MLX
@@ -41,8 +39,6 @@ final class D1DeciderParityTests: XCTestCase {
         let cases = try JSONDecoder().decode(Golden.self, from: data).cases
 
         var idMismatches = [String]()
-        var segmentationGaps = [String]()
-        var gapDeltas = [String]()
         var pickMismatches = [String]()
         var maxDelta = 0.0
         var worst = ""
@@ -51,24 +47,16 @@ final class D1DeciderParityTests: XCTestCase {
         for c in cases {
             let questions = c.questions.map(\.d1)
             let row = try decider.pack(stateText: c.state_text, questions: questions)
-            var gap = false
             if row.ids != c.ids || row.stateLength != c.state_len || row.groups != c.groups {
                 let at =
                     (0 ..< min(row.ids.count, c.ids.count)).first { row.ids[$0] != c.ids[$0] }
                     ?? min(row.ids.count, c.ids.count)
                 let ours = row.ids[at ..< min(at + 4, row.ids.count)].map { $0 }
                 let theirs = c.ids[at ..< min(at + 4, c.ids.count)].map { $0 }
-                let note =
+                idMismatches.append(
                     "\(c.id)@\(at): ours \(ours) \(decider.tokenizer.decode(tokens: ours).debugDescription)"
-                    + " mlx-vlm \(theirs) \(decider.tokenizer.decode(tokens: theirs).debugDescription)"
-                let sameText =
-                    decider.tokenizer.decode(tokens: row.ids) == decider.tokenizer.decode(tokens: c.ids)
-                if !sameText {
-                    idMismatches.append(note)
-                    continue
-                }
-                segmentationGaps.append(note)
-                gap = true
+                        + " mlx-vlm \(theirs) \(decider.tokenizer.decode(tokens: theirs).debugDescription)")
+                continue
             }
             let start = Date()
             let (answers, _) = try decider.decide(stateText: c.state_text, questions: questions)
@@ -79,11 +67,6 @@ final class D1DeciderParityTests: XCTestCase {
                 let delta = zip(a.probabilities, refProbs).map { abs($0 - $1) }.max()!
                 let refPick = a.labels[refProbs.indices.max { refProbs[$0] < refProbs[$1] }!]
                 if a.choice != refPick { pickMismatches.append("\(c.id).\(q.name)") }
-                // A different input, not a kernel difference: reported apart.
-                if gap {
-                    gapDeltas.append("\(c.id).\(q.name): \(delta)")
-                    continue
-                }
                 deltas.append(delta)
                 if delta > maxDelta { worst = "\(c.id).\(q.name)" }
                 maxDelta = max(maxDelta, delta)
@@ -94,8 +77,6 @@ final class D1DeciderParityTests: XCTestCase {
         let report: [String: Any] = [
             "cases": cases.count,
             "id_mismatches": idMismatches,
-            "segmentation_gaps": segmentationGaps,
-            "segmentation_gap_deltas": gapDeltas,
             "pick_mismatches": pickMismatches,
             "max_probability_delta": maxDelta,
             "worst_case": worst,
