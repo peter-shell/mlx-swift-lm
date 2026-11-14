@@ -377,6 +377,24 @@ public class LFM3ModelInner: Module {
 
         return embeddingNorm(h)
     }
+
+    /// The final hidden states of one row under masks the caller builds: no
+    /// cache, positions from zero, the convolutions causal from a zero state.
+    ///
+    /// This is what d1's set attention reads (`D1Decider`): its global layers
+    /// see the state and each question's own tokens both ways, which no
+    /// cache-derived mask can say.
+    public func hidden(
+        _ inputs: MLXArray,
+        fullMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        slidingMask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
+        var h = embedTokens(inputs)
+        for (i, layer) in layers.enumerated() {
+            h = layer(h, mask: args.isSliding(i) ? slidingMask : fullMask, cache: nil)
+        }
+        return embeddingNorm(h)
+    }
 }
 
 public class LFM3Model: Module, LLMModel, KVCacheDimensionProvider, MasksEachCacheGeometry {
